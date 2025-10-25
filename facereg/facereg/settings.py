@@ -39,9 +39,11 @@ INSTALLED_APPS = [
     'django.contrib.staticfiles',
     'rest_framework',
     'regface',
+    'corsheaders',
 ]
 
 MIDDLEWARE = [
+    'corsheaders.middleware.CorsMiddleware',
     'django.middleware.security.SecurityMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
@@ -69,6 +71,10 @@ TEMPLATES = [
 ]
 
 WSGI_APPLICATION = 'facereg.wsgi.application'
+
+CORS_ALLOWED_ORIGINS = [
+    "http://147.93.27.224",  # Nginx frontend
+]
 
 
 # Database
