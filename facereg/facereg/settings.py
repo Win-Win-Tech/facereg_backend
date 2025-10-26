@@ -74,6 +74,7 @@ WSGI_APPLICATION = 'facereg.wsgi.application'
 
 CORS_ALLOWED_ORIGINS = [
     "http://147.93.27.224",  # Nginx frontend
+    "http://localhost:3000",
 ]
 
 
