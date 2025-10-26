@@ -25,7 +25,7 @@ SECRET_KEY = 'django-insecure-4%-w-sehm9p9rsd2nvw^15nd1ch1(@gd%=^qrkz#$o_f^z&fb=
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
-ALLOWED_HOSTS = ['192.168.0.7', 'localhost', '147.93.27.224', 'apigatekeeper.cloudgentechnologies.com',]
+ALLOWED_HOSTS = ['apigatekeeper.cloudgentechnologies.com','192.168.0.7','localhost','147.93.27.224',]
 
 
 # Application definition
@@ -73,11 +73,14 @@ TEMPLATES = [
 WSGI_APPLICATION = 'facereg.wsgi.application'
 
 CORS_ALLOWED_ORIGINS = [
-    "http://147.93.27.224",  # Nginx frontend
-    "http://localhost:3000",
-    #"https://gatekeeper.cloudgentechnologies.com",
-]
+    "https://gatekeeper.cloudgentechnologies.com",
+    #"http://147.93.27.224",  # Nginx frontend
+    #"http://localhost:3000",
+    ]
 
+CORS_ALLOW_CREDENTIALS = True
+CORS_ALLOW_HEADERS = ['*']
+CORS_ALLOW_METHODS = ['*']
 
 # Database
 # https://docs.djangoproject.com/en/5.2/ref/settings/#databases
