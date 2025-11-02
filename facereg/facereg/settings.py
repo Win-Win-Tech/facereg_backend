@@ -25,10 +25,10 @@ SECRET_KEY = 'django-insecure-4%-w-sehm9p9rsd2nvw^15nd1ch1(@gd%=^qrkz#$o_f^z&fb=
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
-ALLOWED_HOSTS = ['apigatekeeper.cloudgentechnologies.com','147.93.27.224',]
+ALLOWED_HOSTS = ['apigatekeeper.cloudgentechnologies.com','147.93.27.224','127.0.0.1','localhost',]
 
 
-# Application definition
+# Application definition    
 
 INSTALLED_APPS = [
     'django.contrib.admin',
@@ -74,6 +74,8 @@ WSGI_APPLICATION = 'facereg.wsgi.application'
 
 CORS_ALLOWED_ORIGINS = [
     "https://gatekeeper.cloudgentechnologies.com",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
 ]
 
 CORS_ALLOW_CREDENTIALS = True

@@ -1,3 +1,5 @@
+from django.utils import timezone
+from datetime import date
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
@@ -9,6 +11,7 @@ import face_recognition
 import logging
 
 logger = logging.getLogger(__name__)
+
 
 class FaceAttendanceView(APIView):
     def post(self, request):
@@ -27,22 +30,35 @@ class FaceAttendanceView(APIView):
         employees = Employee.objects.all()
         known_encodings = [np.frombuffer(emp.face_encoding) for emp in employees]
 
-        # Use face_distance for better accuracy
+        if not known_encodings:
+            logger.info("No employees registered in the system")
+            return Response({"error": "No employees registered"}, status=status.HTTP_404_NOT_FOUND)
+
         distances = face_recognition.face_distance(known_encodings, uploaded_encoding)
         best_match_index = np.argmin(distances)
         best_distance = distances[best_match_index]
 
-        # Set stricter threshold
         threshold = 0.45
         if best_distance < threshold:
-#           matched_employee = employees[best_match_index]
             matched_employee = employees[int(best_match_index)]
-            AttendanceLog.objects.create(employee=matched_employee)
-            logger.info("Attendance marked for %s", matched_employee.name.strip())
+
+            today = date.today()
+            already_marked = AttendanceLog.objects.filter(
+                employee=matched_employee,
+                timestamp__date=today
+            ).exists()
+
+            if not already_marked:
+                AttendanceLog.objects.create(employee=matched_employee)
+                logger.info("Attendance marked for %s", matched_employee.name.strip())
+            else:
+                logger.info("Attendance already marked today for %s", matched_employee.name.strip())
+
             return Response({
                 "status": "Attendance marked",
                 "employee": matched_employee.name.strip(),
-                "confidence": round(1 - best_distance, 2)
+                "confidence": round(1 - best_distance, 2),
+                "timestamp": timezone.now().strftime("%Y-%m-%d %H:%M:%S")
             }, status=status.HTTP_200_OK)
 
         logger.info("Face not recognized")
@@ -72,6 +88,7 @@ class RegisterEmployeeView(APIView):
             face_encoding=encoding.tobytes()
         )
         logger.info("Employee registered: %s", name)
+
         return Response({
             "status": "Employee registered",
             "employee_id": employee.id,
