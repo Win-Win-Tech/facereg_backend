@@ -3,6 +3,7 @@ from datetime import date
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
+from django.db.models import Min, Max
 from .models import Employee, AttendanceLog
 from .serializers import FaceUploadSerializer
 from .face_utils import get_face_encoding
@@ -27,38 +28,54 @@ class FaceAttendanceView(APIView):
             logger.info("No face detected in uploaded image")
             return Response({"error": "No face detected"}, status=status.HTTP_400_BAD_REQUEST)
 
-        employees = Employee.objects.all()
-        known_encodings = [np.frombuffer(emp.face_encoding) for emp in employees]
+        employees = Employee.objects.only("id", "name", "face_encoding")
+        known_encodings = []
+        employee_map = []
 
-        if not known_encodings:
-            logger.info("No employees registered in the system")
-            return Response({"error": "No employees registered"}, status=status.HTTP_404_NOT_FOUND)
+        for emp in employees:
+            encoding = np.frombuffer(emp.face_encoding)
+            known_encodings.append(encoding)
+            employee_map.append(emp)
 
-        distances = face_recognition.face_distance(known_encodings, uploaded_encoding)
-        best_match_index = np.argmin(distances)
-        best_distance = distances[best_match_index]
-
-        threshold = 0.45
-        if best_distance < threshold:
-            matched_employee = employees[int(best_match_index)]
-
+        matches = face_recognition.compare_faces(known_encodings, uploaded_encoding, tolerance=0.45)
+        if True in matches:
+            best_match_index = matches.index(True)
+            matched_employee = employee_map[best_match_index]
             today = date.today()
-            already_marked = AttendanceLog.objects.filter(
-                employee=matched_employee,
-                timestamp__date=today
-            ).exists()
+            now = timezone.localtime()
 
-            if not already_marked:
-                AttendanceLog.objects.create(employee=matched_employee)
-                logger.info("Attendance marked for %s", matched_employee.name.strip())
+            logs_today = AttendanceLog.objects.filter(employee=matched_employee, timestamp__date=today)
+            has_checkin = any(log.type == "checkin" for log in logs_today)
+            has_checkout = any(log.type == "checkout" for log in logs_today)
+
+            if not has_checkin:
+                entry_type = "checkin"
+                message = f"Welcome, {matched_employee.name.strip()}! Your check-in has been recorded."
+            elif not has_checkout:
+                entry_type = "checkout"
+                message = f"Good job today, {matched_employee.name.strip()}! Your check-out is complete."
             else:
-                logger.info("Attendance already marked today for %s", matched_employee.name.strip())
+                logger.info("Both checkin and checkout already marked for %s", matched_employee.name.strip())
+                return Response({
+                    "status": "Already marked",
+                    "message": "You've already completed both check-in and check-out for today.",
+                    "employee": matched_employee.name.strip(),
+                    "timestamp": now.strftime("%Y-%m-%d %H:%M:%S")
+                }, status=status.HTTP_200_OK)
+
+            AttendanceLog.objects.create(employee=matched_employee, type=entry_type)
+            logger.info("%s marked for %s", entry_type.capitalize(), matched_employee.name.strip())
+
+            confidence = round(1 - face_recognition.face_distance(
+                [known_encodings[best_match_index]], uploaded_encoding
+            )[0], 2)
 
             return Response({
-                "status": "Attendance marked",
+                "status": f"{entry_type.capitalize()} successful",
+                "message": message,
                 "employee": matched_employee.name.strip(),
-                "confidence": round(1 - best_distance, 2),
-                "timestamp": timezone.now().strftime("%Y-%m-%d %H:%M:%S")
+                "confidence": confidence,
+                "timestamp": now.strftime("%Y-%m-%d %H:%M:%S")
             }, status=status.HTTP_200_OK)
 
         logger.info("Face not recognized")
@@ -94,3 +111,24 @@ class RegisterEmployeeView(APIView):
             "employee_id": employee.id,
             "name": employee.name
         }, status=status.HTTP_201_CREATED)
+
+
+class AttendanceSummaryView(APIView):
+    def get(self, request):
+        today = date.today()
+        summary = []
+
+        employees = Employee.objects.prefetch_related("attendancelog_set")
+        for emp in employees:
+            logs = emp.attendancelog_set.filter(timestamp__date=today)
+            checkin_time = logs.filter(type="checkin").aggregate(Min("timestamp"))["timestamp__min"]
+            checkout_time = logs.filter(type="checkout").aggregate(Max("timestamp"))["timestamp__max"]
+
+            summary.append({
+                "employee": emp.name,
+                "date": today.strftime("%Y-%m-%d"),
+                "checkin": checkin_time.strftime("%H:%M:%S") if checkin_time else None,
+                "checkout": checkout_time.strftime("%H:%M:%S") if checkout_time else None,
+            })
+
+        return Response(summary)
