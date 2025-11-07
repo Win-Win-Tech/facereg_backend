@@ -10,6 +10,7 @@ from .face_utils import get_face_encoding
 import numpy as np
 import face_recognition
 import logging
+import base64
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +29,7 @@ class FaceAttendanceView(APIView):
             logger.info("No face detected in uploaded image")
             return Response({"error": "No face detected"}, status=status.HTTP_400_BAD_REQUEST)
 
-        employees = Employee.objects.only("id", "name", "face_encoding")
+        employees = Employee.objects.only("id", "name", "face_encoding", "photo")
         known_encodings = []
         employee_map = []
 
@@ -70,12 +71,15 @@ class FaceAttendanceView(APIView):
                 [known_encodings[best_match_index]], uploaded_encoding
             )[0], 2)
 
+            photo_base64 = base64.b64encode(matched_employee.photo).decode("utf-8") if matched_employee.photo else None
+
             return Response({
                 "status": f"{entry_type.capitalize()} successful",
                 "message": message,
                 "employee": matched_employee.name.strip(),
                 "confidence": confidence,
-                "timestamp": now.strftime("%Y-%m-%d %H:%M:%S")
+                "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
+                "photo": f"data:image/jpeg;base64,{photo_base64}" if photo_base64 else None
             }, status=status.HTTP_200_OK)
 
         logger.info("Face not recognized")
@@ -90,7 +94,9 @@ class RegisterEmployeeView(APIView):
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
         image = serializer.validated_data['image']
-        encoding = get_face_encoding(image.read())
+        image_bytes = image.read()
+        encoding = get_face_encoding(image_bytes)
+
         if encoding is None:
             logger.info("No face detected during registration")
             return Response({"error": "No face detected"}, status=status.HTTP_400_BAD_REQUEST)
@@ -102,7 +108,8 @@ class RegisterEmployeeView(APIView):
 
         employee = Employee.objects.create(
             name=name,
-            face_encoding=encoding.tobytes()
+            face_encoding=encoding.tobytes(),
+            photo=image_bytes
         )
         logger.info("Employee registered: %s", name)
 
