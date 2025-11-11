@@ -12,6 +12,8 @@ https://docs.djangoproject.com/en/5.2/ref/settings/
 
 import os
 from pathlib import Path
+from corsheaders.defaults import default_headers, default_methods
+
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 
@@ -82,8 +84,14 @@ CORS_ALLOWED_ORIGINS = [
 ]
 
 CORS_ALLOW_CREDENTIALS = True
-CORS_ALLOW_HEADERS = ['*']
-CORS_ALLOW_METHODS = ['*']
+
+CORS_ALLOW_HEADERS = list(default_headers) + [
+    "access-control-allow-origin",
+    "authorization",
+    "content-type",
+]
+
+CORS_ALLOW_METHODS = list(default_methods)
 
 # Database
 # https://docs.djangoproject.com/en/5.2/ref/settings/#databases
