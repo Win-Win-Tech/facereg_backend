@@ -1,0 +1,22 @@
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+*.log
+*.sqlite3
+
+# Local virtual environments
+venv/
+env/
+.venv/
+.env/
+facereg/venv/
+
+# Local CMake bundle
+facereg/cmake-*/
+
+# IDE and OS cruft
+.idea/
+.vscode/
+.DS_Store
+
