@@ -21,6 +21,7 @@ from .face_utils import get_face_encoding
 from .models import AttendanceLog, AuthToken, Employee, Location, PayrollRecord, User
 from .serializers import (
     EmployeeRegisterSerializer,
+    EmployeeListSerializer,
     EmployeeSerializer,
     EmployeeUpdateSerializer,
     FaceUploadSerializer,
@@ -45,7 +46,14 @@ class LocationListCreateView(AuthenticatedAPIView):
     def get(self, request):
         include_deleted = request.query_params.get("include_deleted") == "true"
         locations = Location.objects.all()
-        if not include_deleted:
+        if not is_superadmin(request.user):
+            if not request.user.location_id:
+                return Response(
+                    {"detail": "Admin user is not assigned to a location."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            locations = locations.filter(pk=request.user.location_id, is_deleted=False)
+        elif not include_deleted:
             locations = locations.filter(is_deleted=False)
         serializer = LocationSerializer(locations, many=True)
         return Response(serializer.data)
@@ -75,6 +83,8 @@ class LocationDetailView(AuthenticatedAPIView):
         location = self.get_object(pk)
         if not location:
             return Response(status=status.HTTP_404_NOT_FOUND)
+        if request.user.role == User.Role.ADMIN and location.id != request.user.location_id:
+            return Response(status=status.HTTP_403_FORBIDDEN)
         serializer = LocationSerializer(location)
         return Response(serializer.data)
 
@@ -259,7 +269,7 @@ class EmployeeListView(AuthenticatedAPIView):
             queryset = queryset.filter(location=request.user.location)
         elif location_id:
             queryset = queryset.filter(location_id=location_id)
-        serializer = EmployeeSerializer(queryset, many=True)
+        serializer = EmployeeListSerializer(queryset, many=True)
         return Response(serializer.data)
 
 
@@ -404,9 +414,9 @@ class FaceAttendanceView(APIView):
                 )
                 return Response(
                     {
-                        "status": "Already marked",
-                        "message": "You've already completed both check-in and check-out for today.",
-                        "employee": matched_employee.name.strip(),
+                    "status": "Already marked",
+                    "message": "You've already completed both check-in and check-out for today.",
+                    "employee": matched_employee.name.strip(),
                         "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
                     },
                     status=status.HTTP_200_OK,
@@ -417,7 +427,7 @@ class FaceAttendanceView(APIView):
 
             confidence = round(
                 1 - face_recognition.face_distance(
-                    [known_encodings[best_match_index]], uploaded_encoding
+                [known_encodings[best_match_index]], uploaded_encoding
                 )[0],
                 2,
             )
@@ -430,11 +440,11 @@ class FaceAttendanceView(APIView):
 
             return Response(
                 {
-                    "status": f"{entry_type.capitalize()} successful",
-                    "message": message,
-                    "employee": matched_employee.name.strip(),
-                    "confidence": confidence,
-                    "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
+                "status": f"{entry_type.capitalize()} successful",
+                "message": message,
+                "employee": matched_employee.name.strip(),
+                "confidence": confidence,
+                "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
                     "photo": f"data:image/jpeg;base64,{photo_base64}"
                     if photo_base64
                     else None,
@@ -489,8 +499,8 @@ class RegisterEmployeeView(AuthenticatedAPIView):
 
         return Response(
             {
-                "status": "Employee registered",
-                "employee_id": employee.id,
+            "status": "Employee registered",
+            "employee_id": employee.id,
                 "name": employee.name,
                 "location_id": str(location.id),
             },
@@ -526,8 +536,8 @@ class AttendanceSummaryView(AuthenticatedAPIView):
 
             summary.append(
                 {
-                    "employee": emp.name,
-                    "date": today.strftime("%Y-%m-%d"),
+                "employee": emp.name,
+                "date": today.strftime("%Y-%m-%d"),
                     "checkin": checkin_time.strftime("%H:%M:%S")
                     if checkin_time
                     else None,
@@ -573,10 +583,10 @@ class AttendanceSummaryExportView(AuthenticatedAPIView):
 
             ws.append(
                 [
-                    emp.name,
-                    today.strftime("%Y-%m-%d"),
-                    checkin_time.strftime("%H:%M:%S") if checkin_time else "",
-                    checkout_time.strftime("%H:%M:%S") if checkout_time else "",
+                emp.name,
+                today.strftime("%Y-%m-%d"),
+                checkin_time.strftime("%H:%M:%S") if checkin_time else "",
+                checkout_time.strftime("%H:%M:%S") if checkout_time else "",
                     duration_str,
                 ]
             )
@@ -805,15 +815,15 @@ class PayrollExportView(AuthenticatedAPIView):
         for record in records:
             ws.append(
                 [
-                    record.employee.name,
-                    record.present_days,
-                    record.absent_days,
-                    float(record.base_salary),
-                    float(record.deduction_per_day),
-                    float(record.deductions),
-                    float(record.pf_deduction),
-                    float(record.esi_deduction),
-                    float(record.net_pay),
+                record.employee.name,
+                record.present_days,
+                record.absent_days,
+                float(record.base_salary),
+                float(record.deduction_per_day),
+                float(record.deductions),
+                float(record.pf_deduction),
+                float(record.esi_deduction),
+                float(record.net_pay),
                 ]
             )
 

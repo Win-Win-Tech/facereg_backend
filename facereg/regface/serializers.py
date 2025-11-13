@@ -90,6 +90,19 @@ class UserSerializer(serializers.ModelSerializer):
         return instance
 
 
+class EmployeeListSerializer(serializers.ModelSerializer):
+    location_id = serializers.UUIDField(read_only=True, allow_null=True)
+    location_name = serializers.CharField(source="location.name", read_only=True)
+    has_face_encoding = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Employee
+        fields = ["id", "name", "location_id", "location_name", "has_face_encoding"]
+
+    def get_has_face_encoding(self, obj):
+        return bool(obj.face_encoding)
+
+
 class EmployeeSerializer(serializers.ModelSerializer):
     location_id = serializers.PrimaryKeyRelatedField(
         source="location", queryset=Location.objects.filter(is_deleted=False)
