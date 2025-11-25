@@ -4,7 +4,10 @@ from django.urls import path, include
 urlpatterns = [
     path('admin/', admin.site.urls),
     path('api/', include('regface.urls')),  # ✅ All regface views are routed here
+    path('shift/', include('createshift.urls')),  # ✅ All regface views are routed here
+
 ]
+
 
 from django.conf import settings
 from django.conf.urls.static import static

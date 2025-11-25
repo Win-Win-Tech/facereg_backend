@@ -16,9 +16,9 @@ from openpyxl import Workbook
 from rest_framework import permissions, status
 from rest_framework.response import Response
 from rest_framework.views import APIView
-
+from django.utils import timezone
 from .face_utils import get_face_encoding
-from .models import AttendanceLog, AuthToken, Employee, Location, PayrollRecord, User
+from .models import AttendanceLog, AuthToken, Employee, Location, PayrollRecord, User, UserSite, Site, Shift, Assignment
 from .serializers import (
     EmployeeRegisterSerializer,
     EmployeeListSerializer,
@@ -356,105 +356,387 @@ class EmployeeDetailView(AuthenticatedAPIView):
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
+# class FaceAttendanceView(APIView):
+#     permission_classes = [permissions.AllowAny]
+#     def post(self, request):
+#         serializer = FaceUploadSerializer(data=request.data)
+#         if not serializer.is_valid():
+#             logger.warning("Invalid face upload data: %s", serializer.errors)
+#             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+#         image = serializer.validated_data["image"]
+#         uploaded_encoding = get_face_encoding(image.read())
+
+#         if uploaded_encoding is None:
+#             logger.info("No face detected in uploaded image")
+#             return Response({"error": "No face detected"}, status=status.HTTP_400_BAD_REQUEST)
+
+#         employees = Employee.objects.only("id", "name", "face_encoding", "photo")
+#         user = getattr(request, "user", None)
+#         if isinstance(user, User) and user.role == User.Role.ADMIN:
+#             employees = employees.filter(location=user.location)
+
+#         known_encodings = []
+#         employee_map = []
+
+#         for emp in employees:
+#             encoding = np.frombuffer(emp.face_encoding)
+#             known_encodings.append(encoding)
+#             employee_map.append(emp)
+
+#         matches = face_recognition.compare_faces(
+#             known_encodings, uploaded_encoding, tolerance=0.45
+#         )
+#         if True in matches:
+#             best_match_index = matches.index(True)
+#             matched_employee = employee_map[best_match_index]
+#             today = date.today()
+#             now = timezone.localtime()
+
+#             logs_today = AttendanceLog.objects.filter(
+#                 employee=matched_employee, timestamp__date=today
+#             )
+#             has_checkin = any(log.type == "checkin" for log in logs_today)
+#             has_checkout = any(log.type == "checkout" for log in logs_today)
+
+#             if not has_checkin:
+#                 entry_type = "checkin"
+#                 message = f"Welcome, {matched_employee.name.strip()}! Your check-in has been recorded."
+#             elif not has_checkout:
+#                 entry_type = "checkout"
+#                 message = (
+#                     f"Good job today, {matched_employee.name.strip()}! Your check-out is complete."
+#                 )
+#             else:
+#                 logger.info(
+#                     "Both checkin and checkout already marked for %s",
+#                     matched_employee.name.strip(),
+#                 )
+#                 return Response(
+#                     {
+#                     "status": "Already marked",
+#                     "message": "You've already completed both check-in and check-out for today.",
+#                     "employee": matched_employee.name.strip(),
+#                         "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
+#                     },
+#                     status=status.HTTP_200_OK,
+#                 )
+
+#             AttendanceLog.objects.create(employee=matched_employee, type=entry_type)
+#             logger.info("%s marked for %s", entry_type.capitalize(), matched_employee.name.strip())
+
+#             confidence = round(
+#                 1 - face_recognition.face_distance(
+#                 [known_encodings[best_match_index]], uploaded_encoding
+#                 )[0],
+#                 2,
+#             )
+
+#             photo_base64 = (
+#                 base64.b64encode(matched_employee.photo).decode("utf-8")
+#                 if matched_employee.photo
+#                 else None
+#             )
+
+#             return Response(
+#                 {
+#                 "status": f"{entry_type.capitalize()} successful",
+#                 "message": message,
+#                 "employee": matched_employee.name.strip(),
+#                 "confidence": confidence,
+#                 "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
+#                     "photo": f"data:image/jpeg;base64,{photo_base64}"
+#                     if photo_base64
+#                     else None,
+#                 },
+#                 status=status.HTTP_200_OK,
+#             )
+
+#         logger.info("Face not recognized")
+#         return Response({"error": "Face not recognized"}, status=status.HTTP_404_NOT_FOUND)
+
+# class FaceAttendanceView(APIView):
+#     permission_classes = [permissions.AllowAny]
+
+#     def post(self, request):
+#         serializer = FaceUploadSerializer(data=request.data)
+#         if not serializer.is_valid():
+#             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+#         image_bytes = serializer.validated_data["image"].read()
+#         uploaded_encoding = get_face_encoding(image_bytes)
+#         if uploaded_encoding is None:
+#             return Response({"error": "No face detected"}, status=status.HTTP_400_BAD_REQUEST)
+
+#         employees = Employee.objects.only("id", "name", "face_encoding", "photo", "location")
+#         user = getattr(request, "user", None)
+#         if isinstance(user, User) and user.role == User.Role.ADMIN:
+#             employees = employees.filter(location=user.location)
+
+#         known_encodings, employee_map = [], []
+#         for emp in employees:
+#             if emp.face_encoding:
+#                 known_encodings.append(np.frombuffer(emp.face_encoding))
+#                 employee_map.append(emp)
+
+#         if not known_encodings:
+#             return Response({"error": "No registered employees"}, status=status.HTTP_404_NOT_FOUND)
+
+#         distances = face_recognition.face_distance(known_encodings, uploaded_encoding)
+#         best_match_index = np.argmin(distances)
+#         if distances[best_match_index] > 0.45:
+#             return Response({"error": "Face not recognized"}, status=status.HTTP_404_NOT_FOUND)
+
+#         matched_employee = employee_map[best_match_index]
+#         print("matched_employee",matched_employee)
+#         today = date.today()
+#         now = timezone.now()
+
+#         # --- Attendance rules ---
+#         assignment = Assignment.objects.filter(user_id=matched_employee.id, location_id=matched_employee.location_id).select_related("shift").first()
+#         user_sites = UserSite.objects.filter(user_id=matched_employee.id).select_related("site")
+#         location_sites = Site.objects.filter(location_id=matched_employee.location_id)
+
+#         shift = assignment.shift if assignment else None
+#         sites = [us.site for us in user_sites] if user_sites.exists() else list(location_sites)
+
+#         # Geofence check
+#         lat = float(request.data.get("latitude", 0))
+#         lon = float(request.data.get("longitude", 0))
+#         inside_any = any(self.within_radius(lat, lon, s) for s in sites)
+#         if not inside_any:
+#             return Response({"error": "Outside allowed site radius"}, status=status.HTTP_403_FORBIDDEN)
+
+#         # Shift timing check
+#         status_label = "Checked-in"
+#         if shift:
+#             in_base, in_grace, status_hint = self.in_shift_window(now, shift)
+#             if not in_grace:
+#                 return Response({"error": "Outside allowed shift window"}, status=status.HTTP_403_FORBIDDEN)
+#             if status_hint:
+#                 status_label = status_hint
+
+#         # --- Auto checkin/checkout ---
+#         logs_today = AttendanceLog.objects.filter(employee=matched_employee, timestamp__date=today)
+#         has_checkin = logs_today.filter(type="checkin").exists()
+#         has_checkout = logs_today.filter(type="checkout").exists()
+
+#         if not has_checkin:
+#             entry_type = "checkin"
+#             message = f"Welcome, {matched_employee.name.strip()}! Your check-in has been recorded."
+#         elif not has_checkout:
+#             entry_type = "checkout"
+#             message = f"Good job today, {matched_employee.name.strip()}! Your check-out is complete."
+#         else:
+#             return Response({
+#                 "status": "Already marked",
+#                 "message": "You've already completed both check-in and check-out for today.",
+#                 "employee": matched_employee.name.strip(),
+#                 "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
+#             }, status=status.HTTP_200_OK)
+
+#         AttendanceLog.objects.create(
+#             employee=matched_employee,
+#             type=entry_type,
+#             timestamp=now,
+#             site=nearest_site,                  # ✅ assign nearest site
+#             location=matched_employee.location, # ✅ assign location
+#             # status=status_label (optional if you add field)
+#         )
+
+#         confidence = round(1 - distances[best_match_index], 2)
+#         photo_base64 = base64.b64encode(matched_employee.photo).decode("utf-8") if matched_employee.photo else None
+
+#         return Response({
+#             "status": f"{entry_type.capitalize()} successful",
+#             "message": message,
+#             "employee": matched_employee.name.strip(),
+#             "confidence": confidence,
+#             "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
+#             "photo": f"data:image/jpeg;base64,{photo_base64}" if photo_base64 else None,
+#             "attendance_status": status_label
+#         }, status=status.HTTP_200_OK)
+
+#     # --- Helpers ---
+#     # def within_radius(self, lat, lon, site):
+#     #     from math import radians, sin, cos, asin, sqrt
+#     #     R = 6371000.0
+#     #     dlat = radians(site.latitude - lat)
+#     #     dlon = radians(site.longitude - lon)
+#     #     a = sin(dlat/2)**2 + cos(radians(lat)) * cos(radians(site.latitude)) * sin(dlon/2)**2
+#     #     return R * 2 * asin(sqrt(a)) <= site.radius_meters
+    
+#     def within_radius(self, lat, lon, site):
+#         from math import radians, sin, cos, asin, sqrt
+#         R = 6371000.0
+
+#         site_lat = float(site.latitude)
+#         site_lon = float(site.longitude)
+
+#         dlat = radians(site_lat - float(lat))
+#         dlon = radians(site_lon - float(lon))
+
+#         a = sin(dlat / 2) ** 2 + cos(radians(float(lat))) * cos(radians(site_lat)) * sin(dlon / 2) ** 2
+#         distance = R * 2 * asin(sqrt(a))
+
+#         return distance <= float(site.distance_meters)
+
+
+#     def in_shift_window(self, now, shift):
+#         start_dt = timezone.make_aware(datetime.combine(now.date(), shift.start_time))
+#         end_dt = timezone.make_aware(datetime.combine(now.date(), shift.end_time))
+#         grace = timedelta(minutes=30)
+
+#         in_base = start_dt <= now <= end_dt
+#         in_grace = (start_dt - grace) <= now <= (end_dt + grace)
+#         status_hint = None
+#         if not in_base and in_grace:
+#             status_hint = "Late Check-in" if now > start_dt else "Early Check-out"
+#         return in_base, in_grace, status_hint
+
+
 class FaceAttendanceView(APIView):
     permission_classes = [permissions.AllowAny]
+
     def post(self, request):
         serializer = FaceUploadSerializer(data=request.data)
         if not serializer.is_valid():
-            logger.warning("Invalid face upload data: %s", serializer.errors)
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-        image = serializer.validated_data["image"]
-        uploaded_encoding = get_face_encoding(image.read())
-
+        # --- Face encoding ---
+        image_bytes = serializer.validated_data["image"].read()
+        uploaded_encoding = get_face_encoding(image_bytes)
         if uploaded_encoding is None:
-            logger.info("No face detected in uploaded image")
             return Response({"error": "No face detected"}, status=status.HTTP_400_BAD_REQUEST)
 
-        employees = Employee.objects.only("id", "name", "face_encoding", "photo")
+        employees = Employee.objects.only("id", "name", "face_encoding", "photo", "location")
         user = getattr(request, "user", None)
         if isinstance(user, User) and user.role == User.Role.ADMIN:
             employees = employees.filter(location=user.location)
 
-        known_encodings = []
-        employee_map = []
-
+        known_encodings, employee_map = [], []
         for emp in employees:
-            encoding = np.frombuffer(emp.face_encoding)
-            known_encodings.append(encoding)
-            employee_map.append(emp)
+            if emp.face_encoding:
+                known_encodings.append(np.frombuffer(emp.face_encoding))
+                employee_map.append(emp)
 
-        matches = face_recognition.compare_faces(
-            known_encodings, uploaded_encoding, tolerance=0.45
-        )
-        if True in matches:
-            best_match_index = matches.index(True)
-            matched_employee = employee_map[best_match_index]
-            today = date.today()
-            now = timezone.localtime()
+        if not known_encodings:
+            return Response({"error": "No registered employees"}, status=status.HTTP_404_NOT_FOUND)
 
-            logs_today = AttendanceLog.objects.filter(
-                employee=matched_employee, timestamp__date=today
-            )
-            has_checkin = any(log.type == "checkin" for log in logs_today)
-            has_checkout = any(log.type == "checkout" for log in logs_today)
+        distances = face_recognition.face_distance(known_encodings, uploaded_encoding)
+        best_match_index = np.argmin(distances)
+        if distances[best_match_index] > 0.45:
+            return Response({"error": "Face not recognized"}, status=status.HTTP_404_NOT_FOUND)
 
-            if not has_checkin:
-                entry_type = "checkin"
-                message = f"Welcome, {matched_employee.name.strip()}! Your check-in has been recorded."
-            elif not has_checkout:
-                entry_type = "checkout"
-                message = (
-                    f"Good job today, {matched_employee.name.strip()}! Your check-out is complete."
-                )
-            else:
-                logger.info(
-                    "Both checkin and checkout already marked for %s",
-                    matched_employee.name.strip(),
-                )
-                return Response(
-                    {
-                    "status": "Already marked",
-                    "message": "You've already completed both check-in and check-out for today.",
-                    "employee": matched_employee.name.strip(),
-                        "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
-                    },
-                    status=status.HTTP_200_OK,
-                )
+        matched_employee = employee_map[best_match_index]
+        today = date.today()
+        now = timezone.now()
 
-            AttendanceLog.objects.create(employee=matched_employee, type=entry_type)
-            logger.info("%s marked for %s", entry_type.capitalize(), matched_employee.name.strip())
+        # --- Attendance rules ---
+        assignment = Assignment.objects.filter(
+            user_id=matched_employee.id,
+            location_id=matched_employee.location_id
+        ).select_related("shift").first()
 
-            confidence = round(
-                1 - face_recognition.face_distance(
-                [known_encodings[best_match_index]], uploaded_encoding
-                )[0],
-                2,
-            )
+        user_sites = UserSite.objects.filter(user_id=matched_employee.id).select_related("site")
+        location_sites = Site.objects.filter(location_id=matched_employee.location_id)
 
-            photo_base64 = (
-                base64.b64encode(matched_employee.photo).decode("utf-8")
-                if matched_employee.photo
-                else None
-            )
+        shift = assignment.shift if assignment else None
+        sites = [us.site for us in user_sites] if user_sites.exists() else list(location_sites)
 
-            return Response(
-                {
-                "status": f"{entry_type.capitalize()} successful",
-                "message": message,
+        # --- Geofence check ---
+        lat = float(request.data.get("latitude", 0))
+        lon = float(request.data.get("longitude", 0))
+
+        nearest_site = None
+        nearest_distance = None
+        for s in sites:
+            dist = self.calculate_distance(lat, lon, s)
+            if nearest_distance is None or dist < nearest_distance:
+                nearest_distance = dist
+                nearest_site = s
+
+        if nearest_site is None or nearest_distance > float(nearest_site.distance_meters):
+            return Response({"error": "Outside allowed site radius"}, status=status.HTTP_403_FORBIDDEN)
+
+        # --- Shift timing check ---
+        status_label = "Checked-in"
+        if shift:
+            in_base, in_grace, status_hint = self.in_shift_window(now, shift)
+            if not in_grace:
+                return Response({"error": "Outside allowed shift window"}, status=status.HTTP_403_FORBIDDEN)
+            if status_hint:
+                status_label = status_hint
+
+        # --- Auto checkin/checkout ---
+        logs_today = AttendanceLog.objects.filter(employee=matched_employee, timestamp__date=today)
+        has_checkin = logs_today.filter(type="checkin").exists()
+        has_checkout = logs_today.filter(type="checkout").exists()
+
+        if not has_checkin:
+            entry_type = "checkin"
+            message = f"Welcome, {matched_employee.name.strip()}! Your check-in has been recorded."
+        elif not has_checkout:
+            entry_type = "checkout"
+            message = f"Good job today, {matched_employee.name.strip()}! Your check-out is complete."
+        else:
+            return Response({
+                "status": "Already marked",
+                "message": "You've already completed both check-in and check-out for today.",
                 "employee": matched_employee.name.strip(),
-                "confidence": confidence,
                 "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
-                    "photo": f"data:image/jpeg;base64,{photo_base64}"
-                    if photo_base64
-                    else None,
-                },
-                status=status.HTTP_200_OK,
-            )
+            }, status=status.HTTP_200_OK)
 
-        logger.info("Face not recognized")
-        return Response({"error": "Face not recognized"}, status=status.HTTP_404_NOT_FOUND)
+        AttendanceLog.objects.create(
+            employee=matched_employee,
+            type=entry_type,
+            timestamp=now,
+            site=nearest_site,                  # ✅ assign nearest site
+            location=matched_employee.location, # ✅ assign location
+            # status=status_label (optional if you add field)
+        )
 
+        confidence = round(1 - distances[best_match_index], 2)
+        photo_base64 = base64.b64encode(matched_employee.photo).decode("utf-8") if matched_employee.photo else None
+
+        return Response({
+            "status": f"{entry_type.capitalize()} successful",
+            "message": message,
+            "employee": matched_employee.name.strip(),
+            "confidence": confidence,
+            "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
+            "photo": f"data:image/jpeg;base64,{photo_base64}" if photo_base64 else None,
+            "attendance_status": status_label,
+            "site_id": str(nearest_site.id),
+            "location_id": str(matched_employee.location.id)
+        }, status=status.HTTP_200_OK)
+
+    # --- Helpers ---
+    def calculate_distance(self, lat, lon, site):
+        from math import radians, sin, cos, asin, sqrt
+        R = 6371000.0
+        site_lat = float(site.latitude)
+        site_lon = float(site.longitude)
+
+        print("site.latitude", site.latitude)
+        print("site.longitude", site.longitude)
+
+        dlat = radians(site_lat - lat)
+        dlon = radians(site_lon - lon)
+        a = sin(dlat/2)**2 + cos(radians(lat)) * cos(radians(site_lat)) * sin(dlon/2)**2
+        return R * 2 * asin(sqrt(a))  # distance in meters
+
+    def in_shift_window(self, now, shift):
+        start_dt = timezone.make_aware(datetime.combine(now.date(), shift.start_time))
+        end_dt = timezone.make_aware(datetime.combine(now.date(), shift.end_time))
+        grace = timedelta(minutes=30)
+
+        in_base = start_dt <= now <= end_dt
+        in_grace = (start_dt - grace) <= now <= (end_dt + grace)
+        status_hint = None
+        if not in_base and in_grace:
+            status_hint = "Late Check-in" if now > start_dt else "Early Check-out"
+        return in_base, in_grace, status_hint
 
 class RegisterEmployeeView(AuthenticatedAPIView):
     def post(self, request):
