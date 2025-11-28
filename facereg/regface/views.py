@@ -390,11 +390,15 @@ class FaceAttendanceView(APIView):
         if True in matches:
             best_match_index = matches.index(True)
             matched_employee = employee_map[best_match_index]
-            today = date.today()
+            today = timezone.now().date()
             now = timezone.localtime()
 
+            # Create timezone-aware datetime objects for the start and end of today
+            today_start = timezone.make_aware(datetime.combine(today, datetime.min.time()))
+            today_end = timezone.make_aware(datetime.combine(today, datetime.max.time()))
+
             logs_today = AttendanceLog.objects.filter(
-                employee=matched_employee, timestamp__date=today
+                employee=matched_employee, timestamp__range=(today_start, today_end)
             )
             has_checkin = any(log.type == "checkin" for log in logs_today)
             has_checkout = any(log.type == "checkout" for log in logs_today)
@@ -510,50 +514,95 @@ class RegisterEmployeeView(AuthenticatedAPIView):
 
 class AttendanceSummaryView(AuthenticatedAPIView):
     def get(self, request):
-        today = date.today()
-        summary = []
+        # Accept optional start_date and end_date query params (YYYY-MM-DD).
+        start_date_str = request.query_params.get("start_date")
+        end_date_str = request.query_params.get("end_date")
+
+        if start_date_str and end_date_str:
+            try:
+                start_date = datetime.strptime(start_date_str, "%Y-%m-%d").date()
+                end_date = datetime.strptime(end_date_str, "%Y-%m-%d").date()
+            except Exception:
+                return Response({"error": "Invalid date format, expected YYYY-MM-DD"}, status=status.HTTP_400_BAD_REQUEST)
+        elif start_date_str and not end_date_str:
+            try:
+                start_date = datetime.strptime(start_date_str, "%Y-%m-%d").date()
+                end_date = start_date
+            except Exception:
+                return Response({"error": "Invalid date format, expected YYYY-MM-DD"}, status=status.HTTP_400_BAD_REQUEST)
+        else:
+            # Use timezone-aware current date
+            current_datetime = timezone.now()
+            start_date = end_date = current_datetime.date()
+
+        if start_date > end_date:
+            return Response({"error": "start_date cannot be after end_date"}, status=status.HTTP_400_BAD_REQUEST)
 
         employees = Employee.objects.prefetch_related("attendancelog_set")
         if request.user.role == User.Role.ADMIN:
             employees = employees.filter(location=request.user.location)
 
-        for emp in employees:
-            logs = emp.attendancelog_set.filter(timestamp__date=today)
-            checkin_time = logs.filter(type="checkin").aggregate(Min("timestamp"))[
-                "timestamp__min"
-            ]
-            checkout_time = logs.filter(type="checkout").aggregate(Max("timestamp"))[
-                "timestamp__max"
-            ]
+        summary = []
+        # iterate dates in range and collect per-employee rows per date
+        delta_days = (end_date - start_date).days
+        for single_day_offset in range(delta_days + 1):
+            current_date = start_date + timedelta(days=single_day_offset)
+            # Create timezone-aware datetime objects for the start and end of the day
+            day_start = timezone.make_aware(datetime.combine(current_date, datetime.min.time()))
+            day_end = timezone.make_aware(datetime.combine(current_date, datetime.max.time()))
 
-            if checkin_time and checkout_time:
-                duration_seconds = (checkout_time - checkin_time).total_seconds()
-                hours = int(duration_seconds // 3600)
-                minutes = int((duration_seconds % 3600) // 60)
-                duration_str = f"{hours:02d}:{minutes:02d}"
-            else:
-                duration_str = None
+            for emp in employees:
+                logs = emp.attendancelog_set.filter(timestamp__range=(day_start, day_end))
+                checkin_time = logs.filter(type="checkin").aggregate(Min("timestamp"))["timestamp__min"]
+                checkout_time = logs.filter(type="checkout").aggregate(Max("timestamp"))["timestamp__max"]
 
-            summary.append(
-                {
-                "employee": emp.name,
-                "date": today.strftime("%Y-%m-%d"),
-                    "checkin": checkin_time.strftime("%H:%M:%S")
-                    if checkin_time
-                    else None,
-                    "checkout": checkout_time.strftime("%H:%M:%S")
-                    if checkout_time
-                    else None,
-                    "duration": duration_str,
-                }
-            )
+                if checkin_time and checkout_time:
+                    duration_seconds = (checkout_time - checkin_time).total_seconds()
+                    hours = int(duration_seconds // 3600)
+                    minutes = int((duration_seconds % 3600) // 60)
+                    duration_str = f"{hours:02d}:{minutes:02d}"
+                else:
+                    duration_str = None
+
+                summary.append(
+                    {
+                        "employee": emp.name,
+                        "date": current_date.strftime("%Y-%m-%d"),
+                        "checkin": checkin_time.strftime("%H:%M:%S") if checkin_time else None,
+                        "checkout": checkout_time.strftime("%H:%M:%S") if checkout_time else None,
+                        "duration": duration_str,
+                    }
+                )
 
         return Response(summary)
 
 
 class AttendanceSummaryExportView(AuthenticatedAPIView):
     def get(self, request):
-        today = date.today()
+        # Support optional start_date and end_date params (YYYY-MM-DD)
+        start_date_str = request.query_params.get("start_date")
+        end_date_str = request.query_params.get("end_date")
+
+        if start_date_str and end_date_str:
+            try:
+                start_date = datetime.strptime(start_date_str, "%Y-%m-%d").date()
+                end_date = datetime.strptime(end_date_str, "%Y-%m-%d").date()
+            except Exception:
+                return Response({"error": "Invalid date format, expected YYYY-MM-DD"}, status=status.HTTP_400_BAD_REQUEST)
+        elif start_date_str and not end_date_str:
+            try:
+                start_date = datetime.strptime(start_date_str, "%Y-%m-%d").date()
+                end_date = start_date
+            except Exception:
+                return Response({"error": "Invalid date format, expected YYYY-MM-DD"}, status=status.HTTP_400_BAD_REQUEST)
+        else:
+            # Use timezone-aware current date
+            current_datetime = timezone.now()
+            start_date = end_date = current_datetime.date()
+
+        if start_date > end_date:
+            return Response({"error": "start_date cannot be after end_date"}, status=status.HTTP_400_BAD_REQUEST)
+
         wb = Workbook()
         ws = wb.active
         ws.title = "Attendance Summary"
@@ -564,35 +613,37 @@ class AttendanceSummaryExportView(AuthenticatedAPIView):
         if request.user.role == User.Role.ADMIN:
             employees = employees.filter(location=request.user.location)
 
-        for emp in employees:
-            logs = emp.attendancelog_set.filter(timestamp__date=today)
-            checkin_time = logs.filter(type="checkin").aggregate(Min("timestamp"))[
-                "timestamp__min"
-            ]
-            checkout_time = logs.filter(type="checkout").aggregate(Max("timestamp"))[
-                "timestamp__max"
-            ]
+        delta_days = (end_date - start_date).days
+        for single_day_offset in range(delta_days + 1):
+            current_date = start_date + timedelta(days=single_day_offset)
+            # Create timezone-aware datetime objects for the start and end of the day
+            day_start = timezone.make_aware(datetime.combine(current_date, datetime.min.time()))
+            day_end = timezone.make_aware(datetime.combine(current_date, datetime.max.time()))
 
-            if checkin_time and checkout_time:
-                duration_seconds = (checkout_time - checkin_time).total_seconds()
-                hours = int(duration_seconds // 3600)
-                minutes = int((duration_seconds % 3600) // 60)
-                duration_str = f"{hours:02d}:{minutes:02d}"
-            else:
-                duration_str = ""
+            for emp in employees:
+                logs = emp.attendancelog_set.filter(timestamp__range=(day_start, day_end))
+                checkin_time = logs.filter(type="checkin").aggregate(Min("timestamp"))["timestamp__min"]
+                checkout_time = logs.filter(type="checkout").aggregate(Max("timestamp"))["timestamp__max"]
 
-            ws.append(
-                [
-                emp.name,
-                today.strftime("%Y-%m-%d"),
-                checkin_time.strftime("%H:%M:%S") if checkin_time else "",
-                checkout_time.strftime("%H:%M:%S") if checkout_time else "",
+                if checkin_time and checkout_time:
+                    duration_seconds = (checkout_time - checkin_time).total_seconds()
+                    hours = int(duration_seconds // 3600)
+                    minutes = int((duration_seconds % 3600) // 60)
+                    duration_str = f"{hours:02d}:{minutes:02d}"
+                else:
+                    duration_str = ""
+
+                ws.append([
+                    emp.name,
+                    current_date.strftime("%Y-%m-%d"),
+                    checkin_time.strftime("%H:%M:%S") if checkin_time else "",
+                    checkout_time.strftime("%H:%M:%S") if checkout_time else "",
                     duration_str,
-                ]
-            )
+                ])
 
-        filename = f"attendance_summary_{today.strftime('%Y%m%d')}.xlsx"
+        filename = f"attendance_summary_{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}.xlsx"
         filepath = os.path.join(settings.MEDIA_ROOT, filename)
+        os.makedirs(settings.MEDIA_ROOT, exist_ok=True)
         wb.save(filepath)
 
         file_url = request.build_absolute_uri(settings.MEDIA_URL + filename)
@@ -625,15 +676,22 @@ class MonthlyAttendanceStatusView(AuthenticatedAPIView):
         if request.user.role == User.Role.ADMIN:
             employees = employees.filter(location=request.user.location)
 
-        logs = AttendanceLog.objects.filter(
-            timestamp__date__range=(start_date, end_date)
-        )
+        # logs = AttendanceLog.objects.filter(
+        #     timestamp__date__range=(start_date, end_date)
+        # )
+        day_start = timezone.make_aware(datetime.combine(start_date, datetime.min.time()))
+        day_end = timezone.make_aware(datetime.combine(end_date, datetime.max.time()))
+
+        logs = AttendanceLog.objects.filter(timestamp__range=(day_start, day_end))
+
+        print(logs)
         if request.user.role == User.Role.ADMIN:
             logs = logs.filter(employee__location=request.user.location)
-
+            
         attendance_map = defaultdict(lambda: defaultdict(lambda: "-"))
         for log in logs:
-            attendance_map[log.employee_id][log.timestamp.date()] = "P"
+            local_date = log.timestamp.astimezone(timezone.get_current_timezone()).date()
+            attendance_map[log.employee_id][local_date] = "P"
 
         summary = []
         for emp in employees:
@@ -669,16 +727,24 @@ class MonthlyAttendanceStatusExportView(AuthenticatedAPIView):
         if request.user.role == User.Role.ADMIN:
             employees = employees.filter(location=request.user.location)
 
-        logs = AttendanceLog.objects.filter(
-            timestamp__date__range=(start_date, end_date)
-        )
+        # logs = AttendanceLog.objects.filter(
+        #     timestamp__date__range=(start_date, end_date)
+        # )
+        
+        day_start = timezone.make_aware(datetime.combine(start_date, datetime.min.time()))
+        day_end = timezone.make_aware(datetime.combine(end_date, datetime.max.time()))
+
+        logs = AttendanceLog.objects.filter(timestamp__range=(day_start, day_end))
+
         if request.user.role == User.Role.ADMIN:
             logs = logs.filter(employee__location=request.user.location)
 
         attendance_map = {}
         for log in logs:
-            key = (log.employee_id, log.timestamp.date())
+            local_date = log.timestamp.astimezone(timezone.get_current_timezone()).date()
+            key = (log.employee_id, local_date)
             attendance_map[key] = "P"
+
 
         wb = Workbook()
         ws = wb.active
@@ -713,6 +779,8 @@ class MonthlyAttendanceStatusExportView(AuthenticatedAPIView):
 
         filename = f"monthly_attendance_{month}.xlsx"
         filepath = os.path.join(settings.MEDIA_ROOT, filename)
+        # Ensure media directory exists before saving the workbook
+        os.makedirs(settings.MEDIA_ROOT, exist_ok=True)
         wb.save(filepath)
 
         file_url = request.build_absolute_uri(settings.MEDIA_URL + filename)
@@ -829,6 +897,8 @@ class PayrollExportView(AuthenticatedAPIView):
 
         filename = f"payroll_{month}.xlsx"
         filepath = os.path.join(settings.MEDIA_ROOT, filename)
+        # Ensure media directory exists before saving the workbook
+        os.makedirs(settings.MEDIA_ROOT, exist_ok=True)
         wb.save(filepath)
 
         file_url = request.build_absolute_uri(settings.MEDIA_URL + filename)

@@ -79,9 +79,13 @@ WSGI_APPLICATION = 'facereg.wsgi.application'
 
 CORS_ALLOWED_ORIGINS = [
     "https://gatekeeper.cloudgentechnologies.com",
+    "https://apigatekeeper.cloudgentechnologies.com",
     "https://genai.cloudgentechnologies.com",
     "http://localhost:3000",
     "http://127.0.0.1:3000",
+    "http://localhost:8081",
+    "http://127.0.0.1:8000",
+    "http://127.0.0.1:8081",
 ]
 
 CORS_ALLOW_CREDENTIALS = True
@@ -90,6 +94,7 @@ CORS_ALLOW_HEADERS = list(default_headers) + [
     "access-control-allow-origin",
     "authorization",
     "content-type",
+    "x-requested-with",
 ]
 
 CORS_ALLOW_METHODS = list(default_methods)
@@ -136,7 +141,8 @@ AUTH_PASSWORD_VALIDATORS = [
 
 LANGUAGE_CODE = 'en-us'
 
-TIME_ZONE = 'UTC'
+TIME_ZONE = 'Asia/Kolkata'
+# TIME_ZONE = 'UTC'
 
 USE_I18N = True
 
