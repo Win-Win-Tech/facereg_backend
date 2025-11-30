@@ -390,8 +390,10 @@ class FaceAttendanceView(APIView):
         if True in matches:
             best_match_index = matches.index(True)
             matched_employee = employee_map[best_match_index]
-            today = timezone.now().date()
-            now = timezone.localtime()
+            #today = timezone.now().date()
+            #now = timezone.localtime()
+            today = timezone.localtime(timezone.now()).date()
+            now = timezone.localtime(timezone.now())  # IST aware
 
             # Create timezone-aware datetime objects for the start and end of today
             today_start = timezone.make_aware(datetime.combine(today, datetime.min.time()))
