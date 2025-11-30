@@ -12,6 +12,10 @@ from django.conf import settings
 from django.db.models import Min, Max
 from django.utils import timezone
 from django.utils.timezone import localtime
+try:
+    from zoneinfo import ZoneInfo
+except Exception:
+    ZoneInfo = None
 from openpyxl import Workbook
 from rest_framework import permissions, status
 from rest_framework.response import Response
@@ -31,6 +35,34 @@ from .serializers import (
 from .authentication import SimpleTokenAuthentication
 
 logger = logging.getLogger(__name__)
+
+
+def _ensure_aware(dt):
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return timezone.make_aware(dt)
+    return dt
+
+
+def to_ist(dt):
+    """Convert a datetime to Asia/Kolkata timezone and return a datetime.
+
+    Accepts naive or aware datetimes. Returns None if input is None.
+    """
+    if dt is None:
+        return None
+    dt = _ensure_aware(dt)
+    if ZoneInfo is not None:
+        return dt.astimezone(ZoneInfo("Asia/Kolkata"))
+    # fallback to pytz if zoneinfo is not available
+    try:
+        import pytz
+
+        tz = pytz.timezone("Asia/Kolkata")
+        return dt.astimezone(tz)
+    except Exception:
+        return dt.astimezone(timezone.get_current_timezone())
 
 
 def is_superadmin(user: User) -> bool:
@@ -392,8 +424,8 @@ class FaceAttendanceView(APIView):
             matched_employee = employee_map[best_match_index]
             #today = timezone.now().date()
             #now = timezone.localtime()
-            today = timezone.localtime(timezone.now()).date()
-            now = timezone.localtime(timezone.now())  # IST aware
+            now = to_ist(timezone.now())
+            today = now.date()
 
             # Create timezone-aware datetime objects for the start and end of today
             today_start = timezone.make_aware(datetime.combine(today, datetime.min.time()))
@@ -450,7 +482,7 @@ class FaceAttendanceView(APIView):
                 "message": message,
                 "employee": matched_employee.name.strip(),
                 "confidence": confidence,
-                "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
+                    "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
                     "photo": f"data:image/jpeg;base64,{photo_base64}"
                     if photo_base64
                     else None,
@@ -570,8 +602,8 @@ class AttendanceSummaryView(AuthenticatedAPIView):
                     {
                         "employee": emp.name,
                         "date": current_date.strftime("%Y-%m-%d"),
-                        "checkin": checkin_time.strftime("%H:%M:%S") if checkin_time else None,
-                        "checkout": checkout_time.strftime("%H:%M:%S") if checkout_time else None,
+                        "checkin": to_ist(checkin_time).strftime("%H:%M:%S") if checkin_time else None,
+                        "checkout": to_ist(checkout_time).strftime("%H:%M:%S") if checkout_time else None,
                         "duration": duration_str,
                     }
                 )
@@ -638,8 +670,8 @@ class AttendanceSummaryExportView(AuthenticatedAPIView):
                 ws.append([
                     emp.name,
                     current_date.strftime("%Y-%m-%d"),
-                    checkin_time.strftime("%H:%M:%S") if checkin_time else "",
-                    checkout_time.strftime("%H:%M:%S") if checkout_time else "",
+                    to_ist(checkin_time).strftime("%H:%M:%S") if checkin_time else "",
+                    to_ist(checkout_time).strftime("%H:%M:%S") if checkout_time else "",
                     duration_str,
                 ])
 
@@ -692,7 +724,7 @@ class MonthlyAttendanceStatusView(AuthenticatedAPIView):
             
         attendance_map = defaultdict(lambda: defaultdict(lambda: "-"))
         for log in logs:
-            local_date = log.timestamp.astimezone(timezone.get_current_timezone()).date()
+            local_date = to_ist(log.timestamp).date()
             attendance_map[log.employee_id][local_date] = "P"
 
         summary = []
@@ -743,7 +775,7 @@ class MonthlyAttendanceStatusExportView(AuthenticatedAPIView):
 
         attendance_map = {}
         for log in logs:
-            local_date = log.timestamp.astimezone(timezone.get_current_timezone()).date()
+            local_date = to_ist(log.timestamp).date()
             key = (log.employee_id, local_date)
             attendance_map[key] = "P"
 
@@ -809,7 +841,7 @@ class GeneratePayrollView(AuthenticatedAPIView):
 
         attendance_map = {}
         for log in logs:
-            key = (log.employee_id, log.timestamp.date())
+            key = (log.employee_id, to_ist(log.timestamp).date())
             attendance_map[key] = "P"
 
         for emp in employees:
