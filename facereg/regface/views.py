@@ -1,4 +1,5 @@
 import base64
+import io
 import logging
 import os
 from calendar import monthrange
@@ -9,7 +10,9 @@ from decimal import Decimal
 import face_recognition
 import numpy as np
 from django.conf import settings
+from django.core.files.storage import default_storage
 from django.db.models import Min, Max
+from django.http import FileResponse, HttpResponse
 from django.utils import timezone
 from django.utils.timezone import localtime
 try:
@@ -676,12 +679,20 @@ class AttendanceSummaryExportView(AuthenticatedAPIView):
                 ])
 
         filename = f"attendance_summary_{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}.xlsx"
-        filepath = os.path.join(settings.MEDIA_ROOT, filename)
-        os.makedirs(settings.MEDIA_ROOT, exist_ok=True)
-        wb.save(filepath)
-
-        file_url = request.build_absolute_uri(settings.MEDIA_URL + filename)
-        return Response({"file_url": file_url})
+        
+        # Save to in-memory buffer instead of disk
+        buffer = io.BytesIO()
+        wb.save(buffer)
+        buffer.seek(0)
+        
+        # Return Excel file as HTTP response (direct download)
+        excel_content = buffer.getvalue()
+        response = HttpResponse(
+            excel_content,
+            content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        )
+        response['Content-Disposition'] = f'attachment; filename="{filename}"'
+        return response
 
 
 class MonthlyAttendanceStatusView(AuthenticatedAPIView):
@@ -812,13 +823,20 @@ class MonthlyAttendanceStatusExportView(AuthenticatedAPIView):
             ws.append(row)
 
         filename = f"monthly_attendance_{month}.xlsx"
-        filepath = os.path.join(settings.MEDIA_ROOT, filename)
-        # Ensure media directory exists before saving the workbook
-        os.makedirs(settings.MEDIA_ROOT, exist_ok=True)
-        wb.save(filepath)
-
-        file_url = request.build_absolute_uri(settings.MEDIA_URL + filename)
-        return Response({"file_url": file_url})
+        
+        # Save to in-memory buffer instead of disk
+        buffer = io.BytesIO()
+        wb.save(buffer)
+        buffer.seek(0)
+        
+        # Return Excel file as HTTP response (direct download)
+        excel_content = buffer.getvalue()
+        response = HttpResponse(
+            excel_content,
+            content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        )
+        response['Content-Disposition'] = f'attachment; filename="{filename}"'
+        return response
 
 
 class GeneratePayrollView(AuthenticatedAPIView):
@@ -930,10 +948,17 @@ class PayrollExportView(AuthenticatedAPIView):
             )
 
         filename = f"payroll_{month}.xlsx"
-        filepath = os.path.join(settings.MEDIA_ROOT, filename)
-        # Ensure media directory exists before saving the workbook
-        os.makedirs(settings.MEDIA_ROOT, exist_ok=True)
-        wb.save(filepath)
-
-        file_url = request.build_absolute_uri(settings.MEDIA_URL + filename)
-        return Response({"file_url": file_url})
+        
+        # Save to in-memory buffer instead of disk
+        buffer = io.BytesIO()
+        wb.save(buffer)
+        buffer.seek(0)
+        
+        # Return Excel file as HTTP response (direct download)
+        excel_content = buffer.getvalue()
+        response = HttpResponse(
+            excel_content,
+            content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        )
+        response['Content-Disposition'] = f'attachment; filename="{filename}"'
+        return response
