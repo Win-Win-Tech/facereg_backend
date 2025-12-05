@@ -636,13 +636,14 @@ class FaceAttendanceView(APIView):
         assignment = Assignment.objects.filter(
             user_id=matched_employee.id,
             location_id=matched_employee.location_id
-        ).select_related("shift").first()
+        ).select_related("shift").order_by("-created_on").first()
 
         user_sites = UserSite.objects.filter(user_id=matched_employee.id).select_related("site")
         location_sites = Site.objects.filter(location_id=matched_employee.location_id)
 
         shift = assignment.shift if assignment else None
-        sites = [us.site for us in user_sites] if user_sites.exists() else list(location_sites)
+        
+        sites = [us.site for us in user_sites] if user_sites.exists() else []
 
         # --- Geofence check ---
         lat = float(request.data.get("latitude", 0))
@@ -650,42 +651,218 @@ class FaceAttendanceView(APIView):
 
         nearest_site = None
         nearest_distance = None
-        for s in sites:
-            dist = self.calculate_distance(lat, lon, s)
-            if nearest_distance is None or dist < nearest_distance:
-                nearest_distance = dist
-                nearest_site = s
 
-        if nearest_site is None or nearest_distance > float(nearest_site.distance_meters):
-            return Response({"error": "Outside allowed site radius"}, status=status.HTTP_403_FORBIDDEN)
+        # If no sites are configured for the user/location, skip geofence enforcement.
+        if sites:
+            for s in sites:
+                dist = self.calculate_distance(lat, lon, s)
+                if nearest_distance is None or dist < nearest_distance:
+                    nearest_distance = dist
+                    nearest_site = s
 
-        # --- Shift timing check ---
-        status_label = "Checked-in"
-        if shift:
-            in_base, in_grace, status_hint = self.in_shift_window(now, shift)
-            if not in_grace:
-                return Response({"error": "Outside allowed shift window"}, status=status.HTTP_403_FORBIDDEN)
-            if status_hint:
-                status_label = status_hint
+            if nearest_site is None or nearest_distance > float(nearest_site.distance_meters):
+                return Response({"error": "Outside allowed site radius"}, status=status.HTTP_403_FORBIDDEN)
+        else:
+            # No site configured: allow attendance without geofence
+            nearest_site = None
+            nearest_distance = None
 
         # --- Auto checkin/checkout ---
         logs_today = AttendanceLog.objects.filter(employee=matched_employee, timestamp__date=today)
-        has_checkin = logs_today.filter(type="checkin").exists()
-        has_checkout = logs_today.filter(type="checkout").exists()
-
-        if not has_checkin:
-            entry_type = "checkin"
-            message = f"Welcome, {matched_employee.name.strip()}! Your check-in has been recorded."
-        elif not has_checkout:
-            entry_type = "checkout"
-            message = f"Good job today, {matched_employee.name.strip()}! Your check-out is complete."
+        if shift:
+            has_checkin = logs_today.filter(type="checkin", shift=shift).exists()
+            has_checkout = logs_today.filter(type="checkout", shift=shift).exists()
         else:
-            return Response({
-                "status": "Already marked",
-                "message": "You've already completed both check-in and check-out for today.",
-                "employee": matched_employee.name.strip(),
-                "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
-            }, status=status.HTTP_200_OK)
+            has_checkin = logs_today.filter(type="checkin").exists()
+            has_checkout = logs_today.filter(type="checkout").exists()
+
+        if shift:
+            last_log = logs_today.filter(shift=shift).order_by("-timestamp").first()
+        else:
+            last_log = logs_today.order_by("-timestamp").first()
+
+        if not last_log:
+            entry_type = "checkin"
+        else:
+            entry_type = "checkout" if last_log.type == "checkin" else "checkin"
+
+        # --- Shift timing check ---
+        status_label = "Checked-in"
+        minutes_late = None
+        minutes_early = None
+        checkout_delta_min = None
+        worked_min = None
+        shift_min = None
+        diff_min = None
+
+        if shift:
+            in_base, in_grace, status_hint = self.in_shift_window(now, shift)
+
+            tz = timezone.get_current_timezone()
+            now_local = timezone.localtime(now) if not timezone.is_naive(now) else timezone.make_aware(now, tz)
+            start_time = shift.start_time
+            end_time = shift.end_time
+            if end_time > start_time:
+                start_dt_naive = datetime.combine(now_local.date(), start_time)
+                end_dt_naive = datetime.combine(now_local.date(), end_time)
+            else:
+               
+                start_dt_naive = datetime.combine(now_local.date(), start_time)
+                end_dt_naive = datetime.combine(now_local.date() + timedelta(days=1), end_time)
+            start_dt = timezone.make_aware(start_dt_naive, tz)
+            end_dt = timezone.make_aware(end_dt_naive, tz)
+
+            logger.info(f"DEBUG: start_time={start_time}, end_time={end_time}, now_local.time()={now_local.time()}")
+            logger.info(f"DEBUG: start_dt={start_dt}, end_dt={end_dt}, now_local={now_local}")
+
+            try:
+                grace_minutes = int(getattr(shift, "grace_timing", 30) or 30)
+            except Exception:
+                grace_minutes = 30
+            grace = timedelta(minutes=grace_minutes)
+
+            if entry_type == "checkin":
+                delta_min = (now_local - start_dt).total_seconds() / 60.0
+                logger.info(f"DEBUG CHECKIN: delta_min={delta_min}, now_local={now_local}, start_dt={start_dt}")
+                if -15 <= delta_min <= 15:
+                    status_label = "On-time Check-in"
+                    minutes_late = 0
+                elif delta_min < -15:
+                    status_label = "Early Check-in"
+                    minutes_early = int(round(abs(delta_min)))
+                elif delta_min > 15:
+                    if delta_min <= 60:
+                        status_label = "Late Check-in"
+                        minutes_late = int(round(delta_min))
+                    else:
+                        status_label = "Missed Check-in"
+                        minutes_late = int(round(delta_min))
+
+
+            else:
+                delta_end_min = (now_local - end_dt).total_seconds() / 60.0
+                checkout_delta_min = int(round(delta_end_min))
+                if -15 <= delta_end_min <= 15:
+                    status_label = "On-time Check-out"
+                elif delta_end_min < -15:
+                    status_label = "Early Check-out"
+                    checkout_delta_min = int(round(abs(delta_end_min)))
+                elif delta_end_min > 15:
+                    if delta_end_min <= 60:
+                        status_label = "Late Check-out"
+                        checkout_delta_min = int(round(delta_end_min))
+                    else:
+                        status_label = "Missed Checked-out"
+                        checkout_delta_min = int(round(delta_end_min))
+
+                if shift:
+                    last_checkin = logs_today.filter(type="checkin", shift=shift).order_by("-timestamp").first()
+                else:
+                    last_checkin = logs_today.filter(type="checkin").order_by("-timestamp").first()
+                if last_checkin:
+                    checkin_ts = last_checkin.timestamp
+                    if timezone.is_naive(checkin_ts):
+                        checkin_ts = timezone.make_aware(checkin_ts, tz)
+                    checkin_time = timezone.localtime(checkin_ts)
+
+                    
+                    if checkin_time > now_local:
+                        if shift:
+                            alt = logs_today.filter(type="checkin", shift=shift, timestamp__lte=now).order_by("-timestamp").first()
+                        else:
+                            alt = logs_today.filter(type="checkin", timestamp__lte=now).order_by("-timestamp").first()
+                        if alt:
+                            checkin_ts = alt.timestamp
+                            if timezone.is_naive(checkin_ts):
+                                checkin_ts = timezone.make_aware(checkin_ts, tz)
+                            checkin_time = timezone.localtime(checkin_ts)
+
+                    worked_min = (now_local - checkin_time).total_seconds() / 60.0
+                    shift_min = (end_dt - start_dt).total_seconds() / 60.0
+                    diff = worked_min - shift_min
+                    diff_min = int(round(diff))
+                    logger.info(
+                        "DEBUG CHECKOUT: checkin_time=%s (tz=%s) now_local=%s (tz=%s)",
+                        checkin_time,
+                        getattr(checkin_time, "tzinfo", None),
+                        now_local,
+                        getattr(now_local, "tzinfo", None),
+                    )
+                    logger.info(
+                        "DEBUG CHECKOUT: start_dt=%s end_dt=%s (tz=%s)",
+                        start_dt,
+                        end_dt,
+                        getattr(start_dt, "tzinfo", None),
+                    )
+                    logger.info(
+                        "DEBUG CHECKOUT: worked_min=%.2f shift_min=%.2f diff=%.2f",
+                        worked_min,
+                        shift_min,
+                        diff,
+                    )
+                    if diff > 60:
+                        status_label = "Overtime"
+                    elif diff < -60:
+                        status_label = "Undertime"
+                if status_hint:
+                    status_label = status_hint
+        else:
+            if entry_type == "checkin":
+                status_label = "Check-in"
+            else:
+                status_label = "Check-out"
+
+        emp_name = matched_employee.name.strip()
+        if entry_type == "checkin":
+            if status_label == "On-time Check-in":
+                message = f"Welcome, {emp_name}! You have checked in on time."
+            elif status_label == "Early Check-in":
+                if minutes_early is not None:
+                    message = f"Welcome, {emp_name}! You have checked in {minutes_early} minutes early."
+                else:
+                    message = f"Welcome, {emp_name}! You have checked in early."
+            elif status_label == "Late Check-in":
+                if minutes_late is not None:
+                    message = f"Welcome, {emp_name}! You have checked in {minutes_late} minutes late."
+                else:
+                    message = f"Welcome, {emp_name}! You have checked in late."
+            elif status_label == "Missed Check-in":
+                if minutes_late is not None:
+                    message = f"Welcome, {emp_name}! You have checked in {minutes_late} minutes late; this is considered a missed check-in."
+                else:
+                    message = f"Welcome, {emp_name}! You have checked in but the check-in time has passed significantly."
+            else:
+                message = f"Welcome, {emp_name}! Your check-in has been recorded."
+        else:  # checkout
+            if status_label == "On-time Check-out":
+                message = f"Good job today, {emp_name}! You have checked out on time."
+            elif status_label == "Early Check-out":
+                if checkout_delta_min is not None:
+                    message = f"Good job today, {emp_name}! You have checked out {abs(checkout_delta_min)} minutes early."
+                else:
+                    message = f"Good job today, {emp_name}! You have checked out early."
+            elif status_label == "Late Check-out":
+                if checkout_delta_min is not None:
+                    message = f"Good job today, {emp_name}! You have checked out {checkout_delta_min} minutes late."
+                else:
+                    message = f"Good job today, {emp_name}! You have checked out late."
+            elif status_label == "Missed Checked-out":
+                if checkout_delta_min is not None:
+                    message = f"Good job today, {emp_name}! You have checked out {abs(checkout_delta_min)} minutes after expected time."
+                else:
+                    message = f"Good job today, {emp_name}! You have checked out but the check-out time has passed significantly."
+            elif status_label == "Overtime":
+                if diff_min is not None:
+                    message = f"Good job today, {emp_name}! You worked {diff_min} minutes overtime."
+                else:
+                    message = f"Good job today, {emp_name}! You worked overtime."
+            elif status_label == "Undertime":
+                if diff_min is not None:
+                    message = f"Good job today, {emp_name}! You worked {abs(diff_min)} minutes less than the scheduled shift."
+                else:
+                    message = f"Good job today, {emp_name}! You worked less than the scheduled shift."
+            else:
+                message = f"Good job today, {emp_name}! Your check-out is complete."
 
         AttendanceLog.objects.create(
             employee=matched_employee,
@@ -693,6 +870,7 @@ class FaceAttendanceView(APIView):
             timestamp=now,
             site=nearest_site,                  # ✅ assign nearest site
             location=matched_employee.location, # ✅ assign location
+            shift=shift,
             # status=status_label (optional if you add field)
         )
 
@@ -700,15 +878,16 @@ class FaceAttendanceView(APIView):
         photo_base64 = base64.b64encode(matched_employee.photo).decode("utf-8") if matched_employee.photo else None
 
         return Response({
-            "status": f"{entry_type.capitalize()} successful",
+            "status": status_label,
             "message": message,
             "employee": matched_employee.name.strip(),
             "confidence": confidence,
             "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
             "photo": f"data:image/jpeg;base64,{photo_base64}" if photo_base64 else None,
             "attendance_status": status_label,
-            "site_id": str(nearest_site.id),
-            "location_id": str(matched_employee.location.id)
+            "site_id": str(nearest_site.id) if nearest_site else None,
+            "location_id": str(matched_employee.location.id),
+            "shift_id": str(shift.id) if shift else None,
         }, status=status.HTTP_200_OK)
 
     # --- Helpers ---
@@ -727,15 +906,53 @@ class FaceAttendanceView(APIView):
         return R * 2 * asin(sqrt(a))  # distance in meters
 
     def in_shift_window(self, now, shift):
-        start_dt = timezone.make_aware(datetime.combine(now.date(), shift.start_time))
-        end_dt = timezone.make_aware(datetime.combine(now.date(), shift.end_time))
-        grace = timedelta(minutes=30)
+        if timezone.is_naive(now):
+            now = timezone.make_aware(now, timezone.get_current_timezone())
 
-        in_base = start_dt <= now <= end_dt
-        in_grace = (start_dt - grace) <= now <= (end_dt + grace)
+        now_local = timezone.localtime(now)
+
+        tz = timezone.get_current_timezone()
+
+        start_time = shift.start_time
+        end_time = shift.end_time
+
+        if end_time > start_time:
+            start_dt_naive = datetime.combine(now_local.date(), start_time)
+            end_dt_naive = datetime.combine(now_local.date(), end_time)
+        else:
+           
+            if now_local.time() >= start_time:
+                start_dt_naive = datetime.combine(now_local.date(), start_time)
+                end_dt_naive = datetime.combine(now_local.date() + timedelta(days=1), end_time)
+            else:
+                start_dt_naive = datetime.combine(now_local.date() - timedelta(days=1), start_time)
+                end_dt_naive = datetime.combine(now_local.date(), end_time)
+
+        start_dt = timezone.make_aware(start_dt_naive, tz)
+        end_dt = timezone.make_aware(end_dt_naive, tz)
+
+        try:
+            grace_minutes = int(getattr(shift, "grace_timing", 30) or 30)
+        except Exception:
+            grace_minutes = 30
+        grace = timedelta(minutes=grace_minutes)
+
+        in_base = start_dt <= now_local <= end_dt
+        in_grace = (start_dt - grace) <= now_local <= (end_dt + grace)
         status_hint = None
+
+        logger.debug(
+            "Shift window check: now=%s start=%s end=%s grace=%s in_base=%s in_grace=%s",
+            now_local,
+            start_dt,
+            end_dt,
+            grace,
+            in_base,
+            in_grace,
+        )
+
         if not in_base and in_grace:
-            status_hint = "Late Check-in" if now > start_dt else "Early Check-out"
+            status_hint = "Late Check-in" if now_local > start_dt else "Early Check-out"
         return in_base, in_grace, status_hint
 
 class RegisterEmployeeView(AuthenticatedAPIView):
