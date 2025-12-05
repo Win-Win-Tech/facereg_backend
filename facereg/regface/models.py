@@ -181,7 +181,7 @@ class AuthToken(models.Model):
 
 class Assignment(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    user = models.ForeignKey("User", on_delete=models.CASCADE)
+    user = models.ForeignKey("Employee", on_delete=models.CASCADE)
     location = models.ForeignKey("Location", on_delete=models.CASCADE)
     shift = models.ForeignKey("Shift", on_delete=models.CASCADE)
     created_on = models.DateTimeField(auto_now_add=True)
@@ -197,7 +197,7 @@ class Assignment(models.Model):
 
 class UserSite(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    user = models.ForeignKey("User", on_delete=models.CASCADE)
+    user = models.ForeignKey("Employee", on_delete=models.CASCADE)
     site = models.ForeignKey("Site", on_delete=models.CASCADE)
     assigned_on = models.DateTimeField(auto_now_add=True)
     assigned_by = models.ForeignKey("User", on_delete=models.SET_NULL, null=True, related_name="assigned_user_sites")
