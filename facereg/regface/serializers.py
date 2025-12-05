@@ -8,6 +8,8 @@ from .models import Employee, Location, User
 
 class FaceUploadSerializer(serializers.Serializer):
     image = serializers.ImageField()
+    latitude = serializers.DecimalField(max_digits=9, decimal_places=6, required=False, allow_null=True)
+    longitude = serializers.DecimalField(max_digits=9, decimal_places=6, required=False, allow_null=True)
 
 
 class EmployeeRegisterSerializer(serializers.Serializer):
@@ -28,7 +30,7 @@ class EmployeeRegisterSerializer(serializers.Serializer):
 class LocationSerializer(serializers.ModelSerializer):
     class Meta:
         model = Location
-        fields = ["id", "name", "created_at", "updated_at", "is_deleted"]
+        fields = ["id", "name", "latitude", "longitude", "address", "created_at", "updated_at", "is_deleted"]
         read_only_fields = ["id", "created_at", "updated_at", "is_deleted"]
 
 

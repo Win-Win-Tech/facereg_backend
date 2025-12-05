@@ -25,6 +25,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from .face_utils import get_face_encoding
+from .geolocation import detect_location_from_coordinates, reverse_geocode
 from .models import AttendanceLog, AuthToken, Employee, Location, PayrollRecord, User
 from .serializers import (
     EmployeeRegisterSerializer,
@@ -463,8 +464,55 @@ class FaceAttendanceView(APIView):
                     status=status.HTTP_200_OK,
                 )
 
-            AttendanceLog.objects.create(employee=matched_employee, type=entry_type)
-            logger.info("%s marked for %s", entry_type.capitalize(), matched_employee.name.strip())
+            latitude = serializer.validated_data.get("latitude")
+            longitude = serializer.validated_data.get("longitude")
+            
+            # Detect location from coordinates
+            detected_location = None
+            location_name = None
+            location_address = None
+            distance = None
+            
+            if latitude and longitude:
+                # Get all active locations with coordinates
+                locations_with_coords = Location.objects.filter(
+                    is_deleted=False,
+                    latitude__isnull=False,
+                    longitude__isnull=False
+                )
+                
+                # Detect which location the employee is at (within 50 meter radius)
+                detected_location, distance = detect_location_from_coordinates(
+                    latitude, longitude, locations_with_coords, radius_km=0.05
+                )
+                
+                # If location detected, use it
+                if detected_location:
+                    location_name = detected_location.name
+                    location_address = detected_location.address
+                else:
+                    # Try reverse geocoding to get address
+                    geo_result = reverse_geocode(latitude, longitude)
+                    if geo_result:
+                        location_name = geo_result.get('city', 'Unknown Location')
+                        location_address = geo_result.get('address')
+            
+            attendance_log = AttendanceLog.objects.create(
+                employee=matched_employee,
+                type=entry_type,
+                latitude=latitude,
+                longitude=longitude,
+                location=detected_location,
+                location_name=location_name,
+                location_address=location_address
+            )
+            logger.info(
+                "%s marked for %s at location: %s (%.2fm away)" if distance else "%s marked for %s",
+                entry_type.capitalize(),
+                matched_employee.name.strip(),
+                location_name or "Unknown",
+                (distance * 1000) if distance else 0  # Convert km to meters
+            )
 
             confidence = round(
                 1 - face_recognition.face_distance(
@@ -489,6 +537,13 @@ class FaceAttendanceView(APIView):
                     "photo": f"data:image/jpeg;base64,{photo_base64}"
                     if photo_base64
                     else None,
+                    "location": {
+                        "name": location_name,
+                        "address": location_address,
+                        "latitude": float(latitude) if latitude else None,
+                        "longitude": float(longitude) if longitude else None,
+                        "distance_meters": round((distance * 1000), 2) if distance else None
+                    }
                 },
                 status=status.HTTP_200_OK,
             )
