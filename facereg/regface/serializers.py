@@ -3,7 +3,7 @@ import base64
 from django.contrib.auth.hashers import make_password
 from rest_framework import serializers
 
-from .models import Employee, Location, User
+from .models import Employee, Location, User, Shift, Site, Assignment, UserSite
 
 
 class FaceUploadSerializer(serializers.Serializer):
@@ -231,3 +231,40 @@ class EmployeeUpdateSerializer(serializers.ModelSerializer):
             setattr(instance, attr, value)
         instance.save()
         return instance
+
+
+class ShiftSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Shift
+        fields = '__all__'
+        read_only_fields = ['id', 'created_on', 'modified_on', 'created_by', 'modified_by', 'deleted_by']
+
+
+class SiteSerializer(serializers.ModelSerializer):
+    location_name = serializers.CharField(source='location.name', read_only=True)
+
+    class Meta:
+        model = Site
+        fields = '__all__'
+        read_only_fields = ['id', 'created_on', 'modified_on', 'created_by', 'modified_by', 'deleted_by']
+
+
+class AssignmentSerializer(serializers.ModelSerializer):
+    user_name = serializers.CharField(source='user.name', read_only=True)
+    shift_name = serializers.CharField(source='shift.shift_name', read_only=True)
+    location_name = serializers.CharField(source='location.name', read_only=True)
+
+    class Meta:
+        model = Assignment
+        fields = '__all__'
+        read_only_fields = ['id', 'created_on', 'modified_on', 'created_by', 'modified_by', 'deleted_by']
+
+
+class UserSiteSerializer(serializers.ModelSerializer):
+    user_name = serializers.CharField(source='user.name', read_only=True)
+    site_name = serializers.CharField(source='site.site_name', read_only=True)
+
+    class Meta:
+        model = UserSite
+        fields = '__all__'
+        read_only_fields = ['id', 'created_on', 'modified_on', 'assigned_on', 'created_by', 'modified_by', 'deleted_by', 'assigned_by']

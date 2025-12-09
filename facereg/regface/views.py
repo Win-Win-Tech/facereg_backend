@@ -27,6 +27,10 @@ from .serializers import (
     FaceUploadSerializer,
     LocationSerializer,
     UserSerializer,
+    ShiftSerializer,
+    SiteSerializer,
+    AssignmentSerializer,
+    UserSiteSerializer,
 )
 from .authentication import SimpleTokenAuthentication
 
@@ -353,6 +357,137 @@ class EmployeeDetailView(AuthenticatedAPIView):
         if not employee:
             return Response(status=status.HTTP_404_NOT_FOUND)
         employee.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class ShiftListView(AuthenticatedAPIView):
+    """List all non-deleted shifts."""
+    def get(self, request):
+        shifts = Shift.objects.filter(is_deleted=False).order_by('shift_name')
+        serializer = ShiftSerializer(shifts, many=True)
+        return Response(serializer.data)
+
+
+class SiteListView(AuthenticatedAPIView):
+    """List all non-deleted sites."""
+    def get(self, request):
+        sites = Site.objects.filter(is_deleted=False).order_by('site_name')
+        serializer = SiteSerializer(sites, many=True)
+        return Response(serializer.data)
+
+
+class AssignmentListCreateView(AuthenticatedAPIView):
+    """List and create employee shift/site assignments."""
+    def get(self, request):
+        queryset = Assignment.objects.filter(is_deleted=False).select_related('user', 'shift', 'location')
+        user_id = request.query_params.get('user_id')
+        
+        if user_id:
+            queryset = queryset.filter(user_id=user_id)
+        
+        if request.user.role == User.Role.ADMIN:
+            queryset = queryset.filter(location=request.user.location)
+        
+        serializer = AssignmentSerializer(queryset, many=True)
+        return Response(serializer.data)
+
+    def post(self, request):
+        data = request.data.copy()
+        data['created_by'] = request.user.id
+        
+        serializer = AssignmentSerializer(data=data)
+        if serializer.is_valid():
+            serializer.save(created_by=request.user)
+            return Response(serializer.data, status=status.HTTP_201_CREATED)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+class AssignmentDetailView(AuthenticatedAPIView):
+    """Update and delete assignments."""
+    def get_object(self, pk):
+        try:
+            return Assignment.objects.get(pk=pk, is_deleted=False)
+        except Assignment.DoesNotExist:
+            return None
+
+    def patch(self, request, pk):
+        assignment = self.get_object(pk)
+        if not assignment:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+        
+        data = request.data.copy()
+        data['modified_by'] = request.user.id
+        
+        serializer = AssignmentSerializer(assignment, data=data, partial=True)
+        if serializer.is_valid():
+            serializer.save(modified_by=request.user)
+            return Response(serializer.data)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    def delete(self, request, pk):
+        assignment = self.get_object(pk)
+        if not assignment:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+        
+        assignment.is_deleted = True
+        assignment.deleted_by = request.user
+        assignment.save(update_fields=['is_deleted', 'deleted_by', 'modified_on', 'modified_by'])
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class UserSiteListCreateView(AuthenticatedAPIView):
+    """List user site assignments and bulk assign sites."""
+    def get(self, request, pk):
+        queryset = UserSite.objects.filter(user_id=pk, is_deleted=False).select_related('user', 'site')
+        
+        serializer = UserSiteSerializer(queryset, many=True)
+        return Response(serializer.data)
+
+    def post(self, request, pk):
+        # Bulk assign sites to user
+        site_ids = request.data.get('site_ids', [])
+        
+        # Mark existing assignments as deleted
+        UserSite.objects.filter(user_id=pk, is_deleted=False).update(
+            is_deleted=True, 
+            deleted_by=request.user,
+            modified_on=timezone.now(),
+            modified_by=request.user
+        )
+        
+        # Create new assignments
+        user_sites = []
+        for site_id in site_ids:
+            user_sites.append(UserSite(
+                user_id=pk,
+                site_id=site_id,
+                assigned_by=request.user,
+                created_by=request.user
+            ))
+        
+        UserSite.objects.bulk_create(user_sites)
+        
+        queryset = UserSite.objects.filter(user_id=pk, is_deleted=False)
+        serializer = UserSiteSerializer(queryset, many=True)
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+
+class UserSiteDetailView(AuthenticatedAPIView):
+    """Delete individual user site assignments."""
+    def get_object(self, pk):
+        try:
+            return UserSite.objects.get(pk=pk, is_deleted=False)
+        except UserSite.DoesNotExist:
+            return None
+
+    def delete(self, request, pk):
+        user_site = self.get_object(pk)
+        if not user_site:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+        
+        user_site.is_deleted = True
+        user_site.deleted_by = request.user
+        user_site.save(update_fields=['is_deleted', 'deleted_by', 'modified_on', 'modified_by'])
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
@@ -1043,42 +1178,166 @@ class RegisterEmployeeView(AuthenticatedAPIView):
 class AttendanceSummaryView(AuthenticatedAPIView):
     def get(self, request):
         today = date.today()
+        start_date = request.query_params.get('start_date', today.strftime('%Y-%m-%d'))
+        end_date = request.query_params.get('end_date', today.strftime('%Y-%m-%d'))
+        
+        try:
+            start_date = datetime.strptime(start_date, '%Y-%m-%d').date()
+            end_date = datetime.strptime(end_date, '%Y-%m-%d').date()
+        except ValueError:
+            start_date = today
+            end_date = today
+        
         summary = []
 
-        employees = Employee.objects.prefetch_related("attendancelog_set")
+        employees = Employee.objects.select_related("location").prefetch_related("attendancelog_set")
         if request.user.role == User.Role.ADMIN:
             employees = employees.filter(location=request.user.location)
 
         for emp in employees:
-            logs = emp.attendancelog_set.filter(timestamp__date=today)
-            checkin_time = logs.filter(type="checkin").aggregate(Min("timestamp"))[
-                "timestamp__min"
-            ]
-            checkout_time = logs.filter(type="checkout").aggregate(Max("timestamp"))[
-                "timestamp__max"
-            ]
-
-            if checkin_time and checkout_time:
-                duration_seconds = (checkout_time - checkin_time).total_seconds()
-                hours = int(duration_seconds // 3600)
-                minutes = int((duration_seconds % 3600) // 60)
-                duration_str = f"{hours:02d}:{minutes:02d}"
-            else:
+            logs = emp.attendancelog_set.filter(timestamp__date__range=(start_date, end_date)).select_related('shift', 'site')
+            
+            # Group logs by date
+            logs_by_date = defaultdict(list)
+            for log in logs:
+                log_date = log.timestamp.date()
+                logs_by_date[log_date].append(log)
+            
+            # Get employee's shift assignment
+            assignment = Assignment.objects.filter(
+                user_id=emp.id,
+                location_id=emp.location_id,
+                is_deleted=False
+            ).select_related('shift', 'location').first()
+            
+            shift = assignment.shift if assignment else None
+            
+            # Process each date
+            for log_date in sorted(logs_by_date.keys()):
+                date_logs = logs_by_date[log_date]
+                checkin_log = next((log for log in date_logs if log.type == 'checkin'), None)
+                checkout_log = next((log for log in date_logs if log.type == 'checkout'), None)
+                
+                checkin_time = checkin_log.timestamp if checkin_log else None
+                checkout_time = checkout_log.timestamp if checkout_log else None
+                
+                # Make times timezone-aware for consistent calculations
+                tz = timezone.get_current_timezone()
+                if checkin_time and timezone.is_naive(checkin_time):
+                    checkin_time = timezone.make_aware(checkin_time, tz)
+                if checkout_time and timezone.is_naive(checkout_time):
+                    checkout_time = timezone.make_aware(checkout_time, tz)
+                
+                # Compute duration (worked time)
                 duration_str = None
-
-            summary.append(
-                {
-                "employee": emp.name,
-                "date": today.strftime("%Y-%m-%d"),
-                    "checkin": checkin_time.strftime("%H:%M:%S")
-                    if checkin_time
-                    else None,
-                    "checkout": checkout_time.strftime("%H:%M:%S")
-                    if checkout_time
-                    else None,
-                    "duration": duration_str,
-                }
-            )
+                worked_seconds = None
+                if checkin_time and checkout_time:
+                    worked_seconds = (checkout_time - checkin_time).total_seconds()
+                    hours = int(worked_seconds // 3600)
+                    minutes = int((worked_seconds % 3600) // 60)
+                    duration_str = f"{hours:02d}:{minutes:02d}"
+                
+                # Compute variance and remarks
+                variance_str = "—"
+                remarks = "—"
+                note = "—"
+                status_str = "Present" if checkin_time else "Absent"
+                
+                if shift and checkin_time:
+                    # Shift times
+                    shift_start_time = shift.start_time
+                    shift_end_time = shift.end_time
+                    
+                    # Create aware datetime objects for today
+                    shift_start_dt = timezone.make_aware(
+                        datetime.combine(log_date, shift_start_time),
+                        tz
+                    )
+                    shift_end_dt = timezone.make_aware(
+                        datetime.combine(log_date, shift_end_time),
+                        tz
+                    )
+                    
+                    # Handle night shifts (end_time < start_time)
+                    if shift_end_time < shift_start_time:
+                        shift_end_dt = timezone.make_aware(
+                            datetime.combine(log_date + timedelta(days=1), shift_end_time),
+                            tz
+                        )
+                    
+                    shift_duration_seconds = (shift_end_dt - shift_start_dt).total_seconds()
+                    
+                    # Checkin variance (minutes before/after shift start)
+                    checkin_variance_seconds = (checkin_time - shift_start_dt).total_seconds()
+                    checkin_variance_minutes = int(checkin_variance_seconds / 60)
+                    
+                    # Determine checkin remarks
+                    if -15 <= checkin_variance_minutes <= 15:
+                        remarks = "On-time Check-in"
+                    elif checkin_variance_minutes < -15:
+                        remarks = f"Early Check-in"
+                        note = f"{abs(checkin_variance_minutes)}min early"
+                    elif checkin_variance_minutes > 15:
+                        if checkin_variance_minutes <= 60:
+                            remarks = "Late Check-in"
+                            note = f"{checkin_variance_minutes}min late"
+                        else:
+                            remarks = "Missed Check-in"
+                            note = f">{60}min late"
+                    
+                    # Checkout variance (if checkout exists)
+                    if checkout_time:
+                        checkout_variance_seconds = (shift_end_dt - checkout_time).total_seconds()
+                        checkout_variance_minutes = int(checkout_variance_seconds / 60)
+                        
+                        # Determine checkout remarks (overrides checkin if checkout is later)
+                        if -15 <= checkout_variance_minutes <= 15:
+                            remarks = "On-time Check-out"
+                        elif checkout_variance_minutes < -15:
+                            remarks = f"Late Check-out"
+                            note = f"{abs(checkout_variance_minutes)}min late"
+                        elif checkout_variance_minutes > 15:
+                            remarks = "Early Check-out"
+                            note = f"{checkout_variance_minutes}min early"
+                        
+                        # Compute variance as worked - shift duration
+                        variance_seconds = worked_seconds - shift_duration_seconds
+                        variance_hours = int(abs(variance_seconds) // 3600)
+                        variance_mins = int((abs(variance_seconds) % 3600) // 60)
+                        sign = '-' if variance_seconds < 0 else ''
+                        variance_str = f"{sign}{variance_hours:02d}:{variance_mins:02d}"
+                        
+                        # Update note with variance details
+                        if abs(variance_seconds) <= 15 * 60:
+                            note = "0 to +/- 15min"
+                        elif abs(variance_seconds) <= 60 * 60:
+                            note = f">15min & <60min"
+                        elif variance_seconds > 0:
+                            note = f">+1hr (Overtime)"
+                        else:
+                            note = f"<-1hr (Undertime)"
+                    else:
+                        # No checkout, just use checkin variance
+                        variance_str = "—"
+                
+                summary.append(
+                    {
+                        "date": log_date.strftime("%Y-%m-%d"),
+                        "name": emp.name,
+                        "department": emp.department or "—",
+                        "location": emp.location.name if emp.location else "—",
+                        "shift": shift.shift_name if shift else "—",
+                        "shift_start": shift.start_time.strftime("%H:%M") if shift else "—",
+                        "shift_end": shift.end_time.strftime("%H:%M") if shift else "—",
+                        "checkin": checkin_time.strftime("%Y-%m-%d %H:%M:%S") if checkin_time else "—",
+                        "checkout": checkout_time.strftime("%Y-%m-%d %H:%M:%S") if checkout_time else "—",
+                        "duration": duration_str or "—",
+                        "status": status_str,
+                        "variance": variance_str,
+                        "remarks": remarks,
+                        "note": note,
+                    }
+                )
 
         return Response(summary)
 
@@ -1086,44 +1345,169 @@ class AttendanceSummaryView(AuthenticatedAPIView):
 class AttendanceSummaryExportView(AuthenticatedAPIView):
     def get(self, request):
         today = date.today()
+        start_date = request.query_params.get('start_date', today.strftime('%Y-%m-%d'))
+        end_date = request.query_params.get('end_date', today.strftime('%Y-%m-%d'))
+        
+        try:
+            start_date = datetime.strptime(start_date, '%Y-%m-%d').date()
+            end_date = datetime.strptime(end_date, '%Y-%m-%d').date()
+        except ValueError:
+            start_date = today
+            end_date = today
+        
         wb = Workbook()
         ws = wb.active
         ws.title = "Attendance Summary"
 
-        ws.append(["Employee", "Date", "Check-in", "Check-out", "Duration"])
+        ws.append(["Date", "Location", "Name", "Department", "Shift", "Shift Start", "Shift End", "Check-in", "Check-out", "Duration", "Status", "Variance", "Remarks", "Note"])
 
-        employees = Employee.objects.prefetch_related("attendancelog_set")
+        employees = Employee.objects.select_related("location").prefetch_related("attendancelog_set")
         if request.user.role == User.Role.ADMIN:
             employees = employees.filter(location=request.user.location)
 
         for emp in employees:
-            logs = emp.attendancelog_set.filter(timestamp__date=today)
-            checkin_time = logs.filter(type="checkin").aggregate(Min("timestamp"))[
-                "timestamp__min"
-            ]
-            checkout_time = logs.filter(type="checkout").aggregate(Max("timestamp"))[
-                "timestamp__max"
-            ]
-
-            if checkin_time and checkout_time:
-                duration_seconds = (checkout_time - checkin_time).total_seconds()
-                hours = int(duration_seconds // 3600)
-                minutes = int((duration_seconds % 3600) // 60)
-                duration_str = f"{hours:02d}:{minutes:02d}"
-            else:
+            logs = emp.attendancelog_set.filter(timestamp__date__range=(start_date, end_date)).select_related('shift', 'site')
+            
+            # Group logs by date
+            logs_by_date = defaultdict(list)
+            for log in logs:
+                log_date = log.timestamp.date()
+                logs_by_date[log_date].append(log)
+            
+            # Get employee's shift assignment
+            assignment = Assignment.objects.filter(
+                user_id=emp.id,
+                location_id=emp.location_id,
+                is_deleted=False
+            ).select_related('shift', 'location').first()
+            
+            shift = assignment.shift if assignment else None
+            
+            # Process each date
+            for log_date in sorted(logs_by_date.keys()):
+                date_logs = logs_by_date[log_date]
+                checkin_log = next((log for log in date_logs if log.type == 'checkin'), None)
+                checkout_log = next((log for log in date_logs if log.type == 'checkout'), None)
+                
+                checkin_time = checkin_log.timestamp if checkin_log else None
+                checkout_time = checkout_log.timestamp if checkout_log else None
+                
+                # Make times timezone-aware for consistent calculations
+                tz = timezone.get_current_timezone()
+                if checkin_time and timezone.is_naive(checkin_time):
+                    checkin_time = timezone.make_aware(checkin_time, tz)
+                if checkout_time and timezone.is_naive(checkout_time):
+                    checkout_time = timezone.make_aware(checkout_time, tz)
+                
+                # Compute duration (worked time)
                 duration_str = ""
+                worked_seconds = None
+                if checkin_time and checkout_time:
+                    worked_seconds = (checkout_time - checkin_time).total_seconds()
+                    hours = int(worked_seconds // 3600)
+                    minutes = int((worked_seconds % 3600) // 60)
+                    duration_str = f"{hours:02d}:{minutes:02d}"
+                
+                # Compute variance and remarks
+                variance_str = ""
+                remarks = ""
+                note = ""
+                status_str = "Present" if checkin_time else "Absent"
+                
+                if shift and checkin_time:
+                    # Shift times
+                    shift_start_time = shift.start_time
+                    shift_end_time = shift.end_time
+                    
+                    # Create aware datetime objects for today
+                    shift_start_dt = timezone.make_aware(
+                        datetime.combine(log_date, shift_start_time),
+                        tz
+                    )
+                    shift_end_dt = timezone.make_aware(
+                        datetime.combine(log_date, shift_end_time),
+                        tz
+                    )
+                    
+                    # Handle night shifts (end_time < start_time)
+                    if shift_end_time < shift_start_time:
+                        shift_end_dt = timezone.make_aware(
+                            datetime.combine(log_date + timedelta(days=1), shift_end_time),
+                            tz
+                        )
+                    
+                    shift_duration_seconds = (shift_end_dt - shift_start_dt).total_seconds()
+                    
+                    # Checkin variance (minutes before/after shift start)
+                    checkin_variance_seconds = (checkin_time - shift_start_dt).total_seconds()
+                    checkin_variance_minutes = int(checkin_variance_seconds / 60)
+                    
+                    # Determine checkin remarks
+                    if -15 <= checkin_variance_minutes <= 15:
+                        remarks = "On-time Check-in"
+                    elif checkin_variance_minutes < -15:
+                        remarks = "Early Check-in"
+                        note = f"{abs(checkin_variance_minutes)}min early"
+                    elif checkin_variance_minutes > 15:
+                        if checkin_variance_minutes <= 60:
+                            remarks = "Late Check-in"
+                            note = f"{checkin_variance_minutes}min late"
+                        else:
+                            remarks = "Missed Check-in"
+                            note = f">{60}min late"
+                    
+                    # Checkout variance (if checkout exists)
+                    if checkout_time:
+                        checkout_variance_seconds = (shift_end_dt - checkout_time).total_seconds()
+                        checkout_variance_minutes = int(checkout_variance_seconds / 60)
+                        
+                        # Determine checkout remarks (overrides checkin if checkout is later)
+                        if -15 <= checkout_variance_minutes <= 15:
+                            remarks = "On-time Check-out"
+                        elif checkout_variance_minutes < -15:
+                            remarks = "Late Check-out"
+                            note = f"{abs(checkout_variance_minutes)}min late"
+                        elif checkout_variance_minutes > 15:
+                            remarks = "Early Check-out"
+                            note = f"{checkout_variance_minutes}min early"
+                        
+                        # Compute variance as worked - shift duration
+                        variance_seconds = worked_seconds - shift_duration_seconds
+                        variance_hours = int(abs(variance_seconds) // 3600)
+                        variance_mins = int((abs(variance_seconds) % 3600) // 60)
+                        sign = '-' if variance_seconds < 0 else ''
+                        variance_str = f"{sign}{variance_hours:02d}:{variance_mins:02d}"
+                        
+                        # Update note with variance details
+                        if abs(variance_seconds) <= 15 * 60:
+                            note = "0 to +/- 15min"
+                        elif abs(variance_seconds) <= 60 * 60:
+                            note = f">15min & <60min"
+                        elif variance_seconds > 0:
+                            note = f">+1hr (Overtime)"
+                        else:
+                            note = f"<-1hr (Undertime)"
+                
+                ws.append(
+                    [
+                        log_date.strftime("%Y-%m-%d"),
+                        emp.location.name if emp.location else "—",
+                        emp.name,
+                        emp.department or "—",
+                        shift.shift_name if shift else "—",
+                        shift.start_time.strftime("%H:%M") if shift else "—",
+                        shift.end_time.strftime("%H:%M") if shift else "—",
+                        checkin_time.strftime("%H:%M:%S") if checkin_time else "",
+                        checkout_time.strftime("%H:%M:%S") if checkout_time else "",
+                        duration_str,
+                        status_str,
+                        variance_str,
+                        remarks,
+                        note,
+                    ]
+                )
 
-            ws.append(
-                [
-                emp.name,
-                today.strftime("%Y-%m-%d"),
-                checkin_time.strftime("%H:%M:%S") if checkin_time else "",
-                checkout_time.strftime("%H:%M:%S") if checkout_time else "",
-                    duration_str,
-                ]
-            )
-
-        filename = f"attendance_summary_{today.strftime('%Y%m%d')}.xlsx"
+        filename = f"attendance_summary_{start_date.strftime('%Y%m%d')}_to_{end_date.strftime('%Y%m%d')}.xlsx"
         filepath = os.path.join(settings.MEDIA_ROOT, filename)
         wb.save(filepath)
 

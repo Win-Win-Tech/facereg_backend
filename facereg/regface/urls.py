@@ -1,6 +1,8 @@
 from django.urls import path
 
 from .views import (
+    AssignmentDetailView,
+    AssignmentListCreateView,
     AttendanceSummaryExportView,
     AttendanceSummaryView,
     EmployeeDetailView,
@@ -15,8 +17,12 @@ from .views import (
     MonthlyAttendanceStatusView,
     PayrollExportView,
     RegisterEmployeeView,
+    ShiftListView,
+    SiteListView,
     UserDetailView,
     UserListCreateView,
+    UserSiteDetailView,
+    UserSiteListCreateView,
 )
 
 urlpatterns = [
@@ -52,4 +58,10 @@ urlpatterns = [
     ),
     path("generate-payroll/", GeneratePayrollView.as_view(), name="generate-payroll"),
     path("payroll/export/", PayrollExportView.as_view(), name="payroll-export"),
+    path("shifts/", ShiftListView.as_view(), name="shifts"),
+    path("sites/", SiteListView.as_view(), name="sites"),
+    path("assignments/", AssignmentListCreateView.as_view(), name="assignments"),
+    path("assignments/<uuid:pk>/", AssignmentDetailView.as_view(), name="assignment-detail"),
+    path("users/<int:pk>/sites/", UserSiteListCreateView.as_view(), name="user-sites"),
+    path("user-sites/<uuid:pk>/", UserSiteDetailView.as_view(), name="user-site-detail"),
 ]
