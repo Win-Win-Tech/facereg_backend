@@ -103,6 +103,42 @@ class Employee(models.Model):
     photo = models.BinaryField(null=True, blank=True)
     base_salary = models.DecimalField(max_digits=10, decimal_places=2, default=30000)
     deduction_per_day = models.DecimalField(max_digits=10, decimal_places=2, default=500)
+    
+    # Payslip Fields
+    gross_salary = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    payslip_field_config = models.ForeignKey("payslip.PayslipFieldConfig", on_delete=models.SET_NULL, null=True, blank=True, related_name="employees")
+    
+    # Employee Details (Optional)
+    employee_code = models.CharField(max_length=50, null=True, blank=True)
+    department = models.CharField(max_length=100, null=True, blank=True)
+    designation = models.CharField(max_length=100, null=True, blank=True)
+    experience_years = models.DecimalField(max_digits=5, decimal_places=2, null=True, blank=True)
+    joining_date = models.DateField(null=True, blank=True)
+    
+    # Banking Details (Optional)
+    bank_account_number = models.CharField(max_length=20, null=True, blank=True)
+    ifsc_code = models.CharField(max_length=11, null=True, blank=True)
+    bank_name = models.CharField(max_length=100, null=True, blank=True)
+    
+    # Identification (Optional)
+    pan_number = models.CharField(max_length=10, null=True, blank=True)
+    aadhaar_number = models.CharField(max_length=12, null=True, blank=True)
+    uan_number = models.CharField(max_length=12, null=True, blank=True)  # PF UAN
+    esi_number = models.CharField(max_length=17, null=True, blank=True)
+    
+    # Contact (Optional)
+    email = models.EmailField(null=True, blank=True)
+    phone = models.CharField(max_length=15, null=True, blank=True)
+    address = models.TextField(null=True, blank=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['location', 'employee_code'],
+                condition=models.Q(employee_code__isnull=False),
+                name='unique_employee_code_per_location'
+            )
+        ]
 
     def __str__(self):
         return self.name

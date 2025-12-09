@@ -988,12 +988,45 @@ class RegisterEmployeeView(AuthenticatedAPIView):
 
         profile_bytes = profile_file.read() if profile_file else None
 
-        employee = Employee.objects.create(
-            name=name,
-            location=location,
-            face_encoding=encoding.tobytes(),
-            photo=profile_bytes or face_bytes,
-        )
+        # Handle payslip_field_config_id
+        payslip_field_config = None
+        payslip_field_config_id = serializer.validated_data.get('payslip_field_config_id')
+        if payslip_field_config_id:
+            try:
+                from payslip.models import PayslipFieldConfig
+                payslip_field_config = PayslipFieldConfig.objects.get(pk=payslip_field_config_id, is_deleted=False)
+            except Exception:
+                pass  # Ignore if not found or not accessible
+
+        # Create employee with all fields
+        employee_data = {
+            'name': name,
+            'location': location,
+            'face_encoding': encoding.tobytes(),
+            'photo': profile_bytes or face_bytes,
+            'gross_salary': serializer.validated_data.get('gross_salary'),
+            'payslip_field_config': payslip_field_config,
+            'employee_code': serializer.validated_data.get('employee_code'),
+            'department': serializer.validated_data.get('department'),
+            'designation': serializer.validated_data.get('designation'),
+            'experience_years': serializer.validated_data.get('experience_years'),
+            'joining_date': serializer.validated_data.get('joining_date'),
+            'bank_account_number': serializer.validated_data.get('bank_account_number'),
+            'ifsc_code': serializer.validated_data.get('ifsc_code'),
+            'bank_name': serializer.validated_data.get('bank_name'),
+            'pan_number': serializer.validated_data.get('pan_number'),
+            'aadhaar_number': serializer.validated_data.get('aadhaar_number'),
+            'uan_number': serializer.validated_data.get('uan_number'),
+            'esi_number': serializer.validated_data.get('esi_number'),
+            'email': serializer.validated_data.get('email'),
+            'phone': serializer.validated_data.get('phone'),
+            'address': serializer.validated_data.get('address'),
+        }
+        
+        # Remove None and empty string values (keep empty strings for some fields like address)
+        employee_data = {k: v for k, v in employee_data.items() if v is not None or k in ['address', 'notes']}
+        
+        employee = Employee.objects.create(**employee_data)
         logger.info("Employee registered: %s", name)
 
         return Response(
