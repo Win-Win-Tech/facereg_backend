@@ -360,20 +360,114 @@ class EmployeeDetailView(AuthenticatedAPIView):
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
-class ShiftListView(AuthenticatedAPIView):
-    """List all non-deleted shifts."""
+class ShiftListCreateView(AuthenticatedAPIView):
+    """List all non-deleted shifts and create new shifts."""
     def get(self, request):
         shifts = Shift.objects.filter(is_deleted=False).order_by('shift_name')
         serializer = ShiftSerializer(shifts, many=True)
         return Response(serializer.data)
+    
+    def post(self, request):
+        serializer = ShiftSerializer(data=request.data)
+        if serializer.is_valid():
+            serializer.save(created_by=request.user)
+            return Response(serializer.data, status=status.HTTP_201_CREATED)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 
-class SiteListView(AuthenticatedAPIView):
-    """List all non-deleted sites."""
+class ShiftDetailView(AuthenticatedAPIView):
+    """Retrieve, update, and delete specific shifts."""
+    def get_object(self, pk):
+        try:
+            return Shift.objects.get(pk=pk, is_deleted=False)
+        except Shift.DoesNotExist:
+            return None
+    
+    def get(self, request, pk):
+        shift = self.get_object(pk)
+        if not shift:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+        serializer = ShiftSerializer(shift)
+        return Response(serializer.data)
+    
+    def patch(self, request, pk):
+        shift = self.get_object(pk)
+        if not shift:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+        
+        serializer = ShiftSerializer(shift, data=request.data, partial=True)
+        if serializer.is_valid():
+            serializer.save(modified_by=request.user)
+            return Response(serializer.data)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+    
+    def put(self, request, pk):
+        return self.patch(request, pk)
+    
+    def delete(self, request, pk):
+        shift = self.get_object(pk)
+        if not shift:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+        
+        shift.is_deleted = True
+        shift.deleted_by = request.user
+        shift.save(update_fields=['is_deleted', 'deleted_by', 'modified_on', 'modified_by'])
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class SiteListCreateView(AuthenticatedAPIView):
+    """List all non-deleted sites and create new sites."""
     def get(self, request):
         sites = Site.objects.filter(is_deleted=False).order_by('site_name')
         serializer = SiteSerializer(sites, many=True)
         return Response(serializer.data)
+    
+    def post(self, request):
+        serializer = SiteSerializer(data=request.data)
+        if serializer.is_valid():
+            serializer.save(created_by=request.user)
+            return Response(serializer.data, status=status.HTTP_201_CREATED)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+class SiteDetailView(AuthenticatedAPIView):
+    """Retrieve, update, and delete specific sites."""
+    def get_object(self, pk):
+        try:
+            return Site.objects.get(pk=pk, is_deleted=False)
+        except Site.DoesNotExist:
+            return None
+    
+    def get(self, request, pk):
+        site = self.get_object(pk)
+        if not site:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+        serializer = SiteSerializer(site)
+        return Response(serializer.data)
+    
+    def patch(self, request, pk):
+        site = self.get_object(pk)
+        if not site:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+        
+        serializer = SiteSerializer(site, data=request.data, partial=True)
+        if serializer.is_valid():
+            serializer.save(modified_by=request.user)
+            return Response(serializer.data)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+    
+    def put(self, request, pk):
+        return self.patch(request, pk)
+    
+    def delete(self, request, pk):
+        site = self.get_object(pk)
+        if not site:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+        
+        site.is_deleted = True
+        site.deleted_by = request.user
+        site.save(update_fields=['is_deleted', 'deleted_by', 'modified_on', 'modified_by'])
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class AssignmentListCreateView(AuthenticatedAPIView):
@@ -381,9 +475,15 @@ class AssignmentListCreateView(AuthenticatedAPIView):
     def get(self, request):
         queryset = Assignment.objects.filter(is_deleted=False).select_related('user', 'shift', 'location')
         user_id = request.query_params.get('user_id')
+        location_id = request.query_params.get('location_id')
+        shift_id = request.query_params.get('shift_id')
         
         if user_id:
             queryset = queryset.filter(user_id=user_id)
+        if location_id:
+            queryset = queryset.filter(location_id=location_id)
+        if shift_id:
+            queryset = queryset.filter(shift_id=shift_id)
         
         if request.user.role == User.Role.ADMIN:
             queryset = queryset.filter(location=request.user.location)
@@ -400,6 +500,150 @@ class AssignmentListCreateView(AuthenticatedAPIView):
             serializer.save(created_by=request.user)
             return Response(serializer.data, status=status.HTTP_201_CREATED)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+class BulkAssignmentView(AuthenticatedAPIView):
+    """Bulk create shift assignments and site assignments for multiple employees."""
+    def post(self, request):
+        """
+        Expected request data format:
+        {
+            "employee_ids": [1, 2, 3],
+            "shift_id": "uuid",
+            "location_id": "uuid",
+            "site_ids": ["uuid1", "uuid2"]  # optional
+        }
+        """
+        employee_ids = request.data.get('employee_ids', [])
+        shift_id = request.data.get('shift_id')
+        location_id = request.data.get('location_id')
+        site_ids = request.data.get('site_ids', [])
+        
+        # Validation
+        if not employee_ids or not isinstance(employee_ids, list):
+            return Response(
+                {"error": "employee_ids must be a non-empty list"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        if not shift_id:
+            return Response(
+                {"error": "shift_id is required"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        if not location_id:
+            return Response(
+                {"error": "location_id is required"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Verify shift exists
+        try:
+            shift = Shift.objects.get(pk=shift_id, is_deleted=False)
+        except Shift.DoesNotExist:
+            return Response(
+                {"error": "Shift not found"},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        
+        # Verify location exists
+        try:
+            location = Location.objects.get(pk=location_id, is_deleted=False)
+        except Location.DoesNotExist:
+            return Response(
+                {"error": "Location not found"},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        
+        # Verify sites exist if provided
+        sites = []
+        if site_ids:
+            sites = Site.objects.filter(pk__in=site_ids, is_deleted=False)
+            if len(sites) != len(site_ids):
+                return Response(
+                    {"error": "One or more sites not found"},
+                    status=status.HTTP_404_NOT_FOUND
+                )
+        
+        # Create assignments
+        created_assignments = []
+        created_user_sites = []
+        failed_assignments = []
+        
+        for employee_id in employee_ids:
+            try:
+                # Check if employee exists
+                employee = Employee.objects.get(pk=employee_id)
+                
+                # Check if assignment already exists for this employee and shift
+                existing = Assignment.objects.filter(
+                    user_id=employee_id,
+                    shift_id=shift_id,
+                    location_id=location_id,
+                    is_deleted=False
+                ).first()
+                
+                if existing:
+                    failed_assignments.append({
+                        "employee_id": employee_id,
+                        "error": "Assignment already exists for this employee and shift"
+                    })
+                    continue
+                
+                assignment = Assignment.objects.create(
+                    user_id=employee_id,
+                    shift_id=shift_id,
+                    location_id=location_id,
+                    created_by=request.user
+                )
+                created_assignments.append(assignment)
+                
+                # Create UserSite assignments if sites are provided
+                if sites:
+                    for site in sites:
+                        existing_site_assign = UserSite.objects.filter(
+                            user_id=employee_id,
+                            site_id=site.id,
+                            is_deleted=False
+                        ).first()
+                        
+                        if not existing_site_assign:
+                            user_site = UserSite.objects.create(
+                                user_id=employee_id,
+                                site_id=site.id,
+                                created_by=request.user,
+                                assigned_by=request.user
+                            )
+                            created_user_sites.append(user_site)
+                
+            except Employee.DoesNotExist:
+                failed_assignments.append({
+                    "employee_id": employee_id,
+                    "error": "Employee not found"
+                })
+            except Exception as e:
+                failed_assignments.append({
+                    "employee_id": employee_id,
+                    "error": str(e)
+                })
+        
+        # Serialize created assignments
+        assignment_serializer = AssignmentSerializer(created_assignments, many=True)
+        user_site_serializer = UserSiteSerializer(created_user_sites, many=True)
+        
+        response_data = {
+            "created_assignments": len(created_assignments),
+            "created_site_assignments": len(created_user_sites),
+            "failed": len(failed_assignments),
+            "assignments": assignment_serializer.data,
+            "site_assignments": user_site_serializer.data,
+        }
+        
+        if failed_assignments:
+            response_data["failed_details"] = failed_assignments
+        
+        return Response(response_data, status=status.HTTP_201_CREATED)
 
 
 class AssignmentDetailView(AuthenticatedAPIView):
