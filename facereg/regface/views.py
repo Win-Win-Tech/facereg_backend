@@ -1179,7 +1179,9 @@ class FaceAttendanceView(APIView):
                         shift_min,
                         diff,
                     )
-                    if diff > 60:
+                    if worked_min < 240:
+                        status_label = "Half day Absent"
+                    elif diff > 60:
                         status_label = "Overtime"
                     elif diff < -60:
                         status_label = "Undertime"
@@ -1230,6 +1232,13 @@ class FaceAttendanceView(APIView):
                     message = f"Good job today, {emp_name}! You have checked out {abs(checkout_delta_min)} minutes after expected time."
                 else:
                     message = f"Good job today, {emp_name}! You have checked out but the check-out time has passed significantly."
+            elif status_label == "Half day Absent":
+                if worked_min is not None:
+                    hours_worked = int(worked_min // 60)
+                    mins_worked = int(worked_min % 60)
+                    message = f"{emp_name}, you have worked only {hours_worked} hours {mins_worked} minutes, which is less than 4 hours. This will be marked as Half day Absent."
+                else:
+                    message = f"{emp_name}, you have worked less than 4 hours. This will be marked as Half day Absent."
             elif status_label == "Overtime":
                 if diff_min is not None:
                     message = f"Good job today, {emp_name}! You worked {diff_min} minutes overtime."
@@ -1438,6 +1447,13 @@ class AttendanceSummaryView(AuthenticatedAPIView):
         if request.user.role == User.Role.ADMIN:
             employees = employees.filter(location=request.user.location)
 
+        # Generate all dates in range
+        all_dates = []
+        current_date = start_date
+        while current_date <= end_date:
+            all_dates.append(current_date)
+            current_date += timedelta(days=1)
+
         for emp in employees:
             logs = emp.attendancelog_set.filter(timestamp__date__range=(start_date, end_date)).select_related('shift', 'site')
             
@@ -1456,9 +1472,9 @@ class AttendanceSummaryView(AuthenticatedAPIView):
             
             shift = assignment.shift if assignment else None
             
-            # Process each date
-            for log_date in sorted(logs_by_date.keys()):
-                date_logs = logs_by_date[log_date]
+            # Process each date in range (including dates with no logs)
+            for log_date in all_dates:
+                date_logs = logs_by_date.get(log_date, [])
                 checkin_log = next((log for log in date_logs if log.type == 'checkin'), None)
                 checkout_log = next((log for log in date_logs if log.type == 'checkout'), None)
                 
@@ -1480,6 +1496,28 @@ class AttendanceSummaryView(AuthenticatedAPIView):
                     hours = int(worked_seconds // 3600)
                     minutes = int((worked_seconds % 3600) // 60)
                     duration_str = f"{hours:02d}:{minutes:02d}"
+                
+                # If no checkin on this day, mark as Absent
+                if not checkin_time:
+                    summary.append(
+                        {
+                            "date": log_date.strftime("%Y-%m-%d"),
+                            "name": emp.name,
+                            "department": emp.department or "—",
+                            "location": emp.location.name if emp.location else "—",
+                            "shift": shift.shift_name if shift else "—",
+                            "shift_start": shift.start_time.strftime("%H:%M") if shift else "—",
+                            "shift_end": shift.end_time.strftime("%H:%M") if shift else "—",
+                            "checkin": "—",
+                            "checkout": "—",
+                            "duration": "—",
+                            "status": "Absent",
+                            "variance": "—",
+                            "remarks": "Absent",
+                            "note": "No check-in",
+                        }
+                    )
+                    continue
                 
                 # Compute variance and remarks
                 variance_str = "—"
@@ -1609,6 +1647,13 @@ class AttendanceSummaryExportView(AuthenticatedAPIView):
         if request.user.role == User.Role.ADMIN:
             employees = employees.filter(location=request.user.location)
 
+        # Generate all dates in range
+        all_dates = []
+        current_date = start_date
+        while current_date <= end_date:
+            all_dates.append(current_date)
+            current_date += timedelta(days=1)
+
         for emp in employees:
             logs = emp.attendancelog_set.filter(timestamp__date__range=(start_date, end_date)).select_related('shift', 'site')
             
@@ -1627,9 +1672,9 @@ class AttendanceSummaryExportView(AuthenticatedAPIView):
             
             shift = assignment.shift if assignment else None
             
-            # Process each date
-            for log_date in sorted(logs_by_date.keys()):
-                date_logs = logs_by_date[log_date]
+            # Process each date in range (including dates with no logs)
+            for log_date in all_dates:
+                date_logs = logs_by_date.get(log_date, [])
                 checkin_log = next((log for log in date_logs if log.type == 'checkin'), None)
                 checkout_log = next((log for log in date_logs if log.type == 'checkout'), None)
                 
@@ -1651,6 +1696,26 @@ class AttendanceSummaryExportView(AuthenticatedAPIView):
                     hours = int(worked_seconds // 3600)
                     minutes = int((worked_seconds % 3600) // 60)
                     duration_str = f"{hours:02d}:{minutes:02d}"
+                
+                # If no checkin on this day, mark as Absent
+                if not checkin_time:
+                    ws.append([
+                        log_date.strftime("%Y-%m-%d"),
+                        emp.location.name if emp.location else "—",
+                        emp.name,
+                        emp.department or "—",
+                        shift.shift_name if shift else "—",
+                        shift.start_time.strftime("%H:%M") if shift else "—",
+                        shift.end_time.strftime("%H:%M") if shift else "—",
+                        "—",
+                        "—",
+                        "—",
+                        "Absent",
+                        "—",
+                        "Absent",
+                        "No check-in",
+                    ])
+                    continue
                 
                 # Compute variance and remarks
                 variance_str = ""

@@ -2,8 +2,11 @@ import logging
 from calendar import monthrange
 from decimal import Decimal
 from datetime import datetime
+import os
 
 from django.db.models import Q
+from django.http import FileResponse, Http404
+from django.conf import settings
 from rest_framework import permissions, status
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -22,6 +25,7 @@ from .serializers import (
     PayslipGenerationSerializer,
     PayslipBulkGenerationSerializer,
 )
+from .pdf_generator import generate_payslip_pdf
 
 logger = logging.getLogger(__name__)
 
@@ -680,3 +684,107 @@ class PayslipApproveView(AuthenticatedAPIView):
         
         serializer = PayslipRecordSerializer(record)
         return Response(serializer.data)
+
+
+class PayslipDownloadView(AuthenticatedAPIView):
+    """Download payslip PDF - generates on-demand if not exists"""
+    def get(self, request, pk):
+        try:
+            record = PayslipRecord.objects.select_related('employee', 'template', 'field_config').get(pk=pk)
+        except PayslipRecord.DoesNotExist:
+            return Response(
+                {"detail": "Payslip not found."},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        
+        if request.user.role == User.Role.ADMIN:
+            if record.employee.location_id != request.user.location_id:
+                return Response(status=status.HTTP_403_FORBIDDEN)
+        
+        # Check if PDF file exists
+        if record.pdf_file and record.pdf_file.name:
+            try:
+                # Use the file field directly - Django handles the file path
+                file = record.pdf_file
+                if file.storage.exists(file.name):
+                    response = FileResponse(
+                        file.open('rb'),
+                        content_type='application/pdf'
+                    )
+                    # Sanitize filename for download
+                    safe_filename = f"payslip-{record.month}-{record.employee.name.replace(' ', '_')}.pdf"
+                    response['Content-Disposition'] = f'attachment; filename="{safe_filename}"'
+                    return response
+            except Exception as e:
+                logger.warning(f"Error accessing existing PDF file: {e}, will regenerate")
+        
+        # PDF doesn't exist, generate it on-demand
+        try:
+            # Prepare payslip data for PDF generation
+            payslip_data = {
+                'id': str(record.id),
+                'employee_name': record.employee.name,
+                'employee_id': str(record.employee.id),
+                'employee_email': record.employee.email or '',
+                'month': record.month,
+                'period': record.month,
+                'gross_salary': float(record.gross_salary),
+                'total_earnings': float(record.total_earnings),
+                'total_deductions': float(record.total_deductions),
+                'net_pay': float(record.net_pay),
+                'present_days': record.present_days,
+                'absent_days': record.absent_days,
+                'working_days': record.working_days,
+            }
+            
+            # Add field values from field_values JSON
+            if record.field_values:
+                payslip_data.update(record.field_values)
+            
+            # Prepare template data
+            template_data = None
+            if record.template:
+                template_data = {
+                    'company_name': record.template.company_name or '',
+                    'company_address': record.template.company_address or '',
+                    'company_email': record.template.company_email or '',
+                    'company_phone': record.template.company_phone or '',
+                    'header_text': record.template.header_text or 'PAYSLIP',
+                    'footer_text': record.template.footer_text or 'Confidential - For Employee Use Only',
+                    'header_color': record.template.header_color or '#1e40af',
+                    'footer_color': record.template.footer_color or '#64748b',
+                    'page_size': record.template.page_size or 'A4',
+                    'orientation': record.template.orientation or 'portrait',
+                    'font_size': record.template.font_size or 10,
+                }
+            
+            # Generate PDF
+            pdf_buffer = generate_payslip_pdf(payslip_data, template_data)
+            
+            # Save PDF to record
+            from django.core.files.base import ContentFile
+            filename = f"payslip_{record.month}_{record.employee.id}.pdf"
+            record.pdf_file.save(filename, ContentFile(pdf_buffer.read()), save=True)
+            
+            # Return the PDF
+            pdf_buffer.seek(0)
+            response = FileResponse(
+                pdf_buffer,
+                content_type='application/pdf'
+            )
+            safe_filename = f"payslip-{record.month}-{record.employee.name.replace(' ', '_')}.pdf"
+            response['Content-Disposition'] = f'attachment; filename="{safe_filename}"'
+            return response
+            
+        except ImportError as e:
+            logger.error(f"PDF generation failed - reportlab not installed: {e}")
+            return Response(
+                {"detail": "PDF generation is not available. Please install reportlab: pip install reportlab"},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE
+            )
+        except Exception as e:
+            logger.error(f"Error generating PDF: {e}", exc_info=True)
+            return Response(
+                {"detail": f"Error generating PDF: {str(e)}"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
