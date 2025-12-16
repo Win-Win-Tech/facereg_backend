@@ -1623,16 +1623,23 @@ class AttendanceSummaryView(AuthenticatedAPIView):
                         variance_mins = int((abs(variance_seconds) % 3600) // 60)
                         sign = '-' if variance_seconds < 0 else ''
                         variance_str = f"{sign}{variance_hours:02d}:{variance_mins:02d}"
-                        
-                        # Update note with variance details
-                        if abs(variance_seconds) <= 15 * 60:
-                            note = "0 to +/- 15min"
-                        elif abs(variance_seconds) <= 60 * 60:
-                            note = f">15min & <60min"
-                        elif variance_seconds > 0:
-                            note = f">+1hr (Overtime)"
+
+                        # If total worked time is less than 4 hours => Half day Absent
+                        if worked_seconds is not None and worked_seconds < 4 * 3600:
+                            remarks = "Half day Absent"
+                            wh = int(worked_seconds // 3600)
+                            wm = int((worked_seconds % 3600) // 60)
+                            note = f"Worked {wh}h {wm}m (<4h)"
                         else:
-                            note = f"<-1hr (Undertime)"
+                            # Update note with variance details
+                            if abs(variance_seconds) <= 15 * 60:
+                                note = "0 to +/- 15min"
+                            elif abs(variance_seconds) <= 60 * 60:
+                                note = f">15min & <60min"
+                            elif variance_seconds > 0:
+                                note = f">+1hr (Overtime)"
+                            else:
+                                note = f"<-1hr (Undertime)"
                     else:
                         # No checkout, just use checkin variance
                         variance_str = "—"
@@ -1822,15 +1829,22 @@ class AttendanceSummaryExportView(AuthenticatedAPIView):
                         sign = '-' if variance_seconds < 0 else ''
                         variance_str = f"{sign}{variance_hours:02d}:{variance_mins:02d}"
                         
-                        # Update note with variance details
-                        if abs(variance_seconds) <= 15 * 60:
-                            note = "0 to +/- 15min"
-                        elif abs(variance_seconds) <= 60 * 60:
-                            note = f">15min & <60min"
-                        elif variance_seconds > 0:
-                            note = f">+1hr (Overtime)"
+                        # If total worked time is less than 4 hours => Half day Absent
+                        if worked_seconds is not None and worked_seconds < 4 * 3600:
+                            remarks = "Half day Absent"
+                            wh = int(worked_seconds // 3600)
+                            wm = int((worked_seconds % 3600) // 60)
+                            note = f"Worked {wh}h {wm}m (<4h)"
                         else:
-                            note = f"<-1hr (Undertime)"
+                            # Update note with variance details
+                            if abs(variance_seconds) <= 15 * 60:
+                                note = "0 to +/- 15min"
+                            elif abs(variance_seconds) <= 60 * 60:
+                                note = f">15min & <60min"
+                            elif variance_seconds > 0:
+                                note = f">+1hr (Overtime)"
+                            else:
+                                note = f"<-1hr (Undertime)"
                 
                 ws.append(
                     [
