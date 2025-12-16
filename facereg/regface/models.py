@@ -173,6 +173,11 @@ class AttendanceLog(models.Model):
     shift = models.ForeignKey("Shift", on_delete=models.SET_NULL, null=True, blank=True)
     site = models.ForeignKey("Site", on_delete=models.SET_NULL, null=True, blank=True)
     location = models.ForeignKey("Location", on_delete=models.SET_NULL, null=True, blank=True)
+    
+    # Geolocation fields
+    latitude = models.DecimalField(max_digits=9, decimal_places=6, null=True, blank=True)
+    longitude = models.DecimalField(max_digits=9, decimal_places=6, null=True, blank=True)
+    address = models.TextField(null=True, blank=True)
 
     def __str__(self):
         return f"{self.employee.name} - {self.type} at {self.timestamp.strftime('%Y-%m-%d %H:%M:%S')}"

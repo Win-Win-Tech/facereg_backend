@@ -576,28 +576,33 @@ class BulkAssignmentView(AuthenticatedAPIView):
                 # Check if employee exists
                 employee = Employee.objects.get(pk=employee_id)
                 
-                # Check if assignment already exists for this employee and shift
+                # Check if an assignment already exists for this employee at the location
                 existing = Assignment.objects.filter(
                     user_id=employee_id,
-                    shift_id=shift_id,
                     location_id=location_id,
                     is_deleted=False
                 ).first()
-                
+
                 if existing:
-                    failed_assignments.append({
-                        "employee_id": employee_id,
-                        "error": "Assignment already exists for this employee and shift"
-                    })
-                    continue
-                
-                assignment = Assignment.objects.create(
-                    user_id=employee_id,
-                    shift_id=shift_id,
-                    location_id=location_id,
-                    created_by=request.user
-                )
-                created_assignments.append(assignment)
+                    # If existing assignment uses a different shift, update it to the new shift
+                    if str(existing.shift_id) != str(shift_id):
+                        existing.shift = shift
+                        existing.modified_by = request.user
+                        try:
+                            existing.modified_on = timezone.now()
+                        except Exception:
+                            pass
+                        existing.save(update_fields=["shift", "modified_on", "modified_by"])
+                    # Treat existing (created or updated) as an affected assignment
+                    created_assignments.append(existing)
+                else:
+                    assignment = Assignment.objects.create(
+                        user_id=employee_id,
+                        shift_id=shift_id,
+                        location_id=location_id,
+                        created_by=request.user
+                    )
+                    created_assignments.append(assignment)
                 
                 # Create UserSite assignments if sites are provided
                 if sites:
@@ -988,7 +993,9 @@ class FaceAttendanceView(APIView):
         if uploaded_encoding is None:
             return Response({"error": "No face detected"}, status=status.HTTP_400_BAD_REQUEST)
 
-        employees = Employee.objects.only("id", "name", "face_encoding", "photo", "location")
+        employees = Employee.objects.filter(face_encoding__isnull=False).only(
+            "id", "name", "face_encoding", "photo", "location"
+        )
         user = getattr(request, "user", None)
         if isinstance(user, User) and user.role == User.Role.ADMIN:
             employees = employees.filter(location=user.location)
@@ -1025,22 +1032,47 @@ class FaceAttendanceView(APIView):
         sites = [us.site for us in user_sites] if user_sites.exists() else list(location_sites)
 
         # --- Geofence check ---
-        lat = float(request.data.get("latitude", 0))
-        lon = float(request.data.get("longitude", 0))
+        def _safe_float(value):
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
+        lat = _safe_float(request.data.get("latitude"))
+        lon = _safe_float(request.data.get("longitude"))
+        accuracy = _safe_float(request.data.get("accuracy"))
+        address = request.data.get("address")
 
         nearest_site = None
         nearest_distance = None
 
         # If no sites are configured for the user/location, skip geofence enforcement.
         if sites:
+            if lat is None or lon is None:
+                return Response({"error": "Geolocation not provided"}, status=status.HTTP_400_BAD_REQUEST)
+
             for s in sites:
                 dist = self.calculate_distance(lat, lon, s)
                 if nearest_distance is None or dist < nearest_distance:
                     nearest_distance = dist
                     nearest_site = s
 
-            if nearest_site is None or nearest_distance > float(nearest_site.distance_meters):
-                return Response({"error": "Outside allowed site radius"}, status=status.HTTP_403_FORBIDDEN)
+            # Allow a small buffer equal to reported GPS accuracy (if available) plus 5m slack.
+            allowed_radius = float(nearest_site.distance_meters)
+            if accuracy is not None:
+                allowed_radius += float(accuracy)
+            allowed_radius += 5.0
+
+            if nearest_site is None or nearest_distance > allowed_radius:
+                return Response(
+                    {
+                        "error": "Outside allowed site radius",
+                        "distance_m": round(nearest_distance, 2) if nearest_distance is not None else None,
+                        "allowed_radius_m": round(allowed_radius, 2),
+                        "site_id": str(nearest_site.id) if nearest_site else None,
+                    },
+                    status=status.HTTP_403_FORBIDDEN,
+                )
         else:
             # No site configured: allow attendance without geofence
             nearest_site = None
@@ -1259,6 +1291,9 @@ class FaceAttendanceView(APIView):
             site=nearest_site,                  # ✅ assign nearest site
             location=matched_employee.location, # ✅ assign location
             shift=shift,
+            latitude=lat,
+            longitude=lon,
+            address=address,
             # status=status_label (optional if you add field)
         )
 
