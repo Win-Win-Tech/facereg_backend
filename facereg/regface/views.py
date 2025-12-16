@@ -526,11 +526,15 @@ class BulkAssignmentView(AuthenticatedAPIView):
                 status=status.HTTP_400_BAD_REQUEST
             )
         
-        if not shift_id:
-            return Response(
-                {"error": "shift_id is required"},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+        shift = None
+        if shift_id not in (None, '', 'null'):
+            try:
+                shift = Shift.objects.get(pk=shift_id, is_deleted=False)
+            except Shift.DoesNotExist:
+                return Response(
+                    {"error": "Shift not found"},
+                    status=status.HTTP_404_NOT_FOUND
+                )
         
         if not location_id:
             return Response(
@@ -538,14 +542,7 @@ class BulkAssignmentView(AuthenticatedAPIView):
                 status=status.HTTP_400_BAD_REQUEST
             )
         
-        # Verify shift exists
-        try:
-            shift = Shift.objects.get(pk=shift_id, is_deleted=False)
-        except Shift.DoesNotExist:
-            return Response(
-                {"error": "Shift not found"},
-                status=status.HTTP_404_NOT_FOUND
-            )
+        # `shift` is either a Shift instance or None (no-shift)
         
         # Verify location exists
         try:
@@ -584,8 +581,9 @@ class BulkAssignmentView(AuthenticatedAPIView):
                 ).first()
 
                 if existing:
-                    # If existing assignment uses a different shift, update it to the new shift
-                    if str(existing.shift_id) != str(shift_id):
+                    current_shift_id = existing.shift_id if hasattr(existing, 'shift_id') else (existing.shift.id if existing.shift else None)
+                    new_shift_id = shift.id if shift else None
+                    if current_shift_id != new_shift_id:
                         existing.shift = shift
                         existing.modified_by = request.user
                         try:
@@ -598,7 +596,7 @@ class BulkAssignmentView(AuthenticatedAPIView):
                 else:
                     assignment = Assignment.objects.create(
                         user_id=employee_id,
-                        shift_id=shift_id,
+                        shift=shift,
                         location_id=location_id,
                         created_by=request.user
                     )
@@ -1027,7 +1025,16 @@ class FaceAttendanceView(APIView):
         user_sites = UserSite.objects.filter(user_id=matched_employee.id).select_related("site")
         location_sites = Site.objects.filter(location_id=matched_employee.location_id)
 
-        shift = assignment.shift if assignment else None
+        # Treat as no-shift if assignment missing or shift is not defined or missing/invalid times
+        shift = None
+        if assignment and getattr(assignment, 'shift', None):
+            candidate_shift = assignment.shift
+            start_time = getattr(candidate_shift, 'start_time', None)
+            end_time = getattr(candidate_shift, 'end_time', None)
+            # Accept only when both start and end are present and non-empty.
+            # This avoids treating an assignment with an incomplete/empty shift as a real shift.
+            if start_time not in (None, '') and end_time not in (None, ''):
+                shift = candidate_shift
         
         sites = [us.site for us in user_sites] if user_sites.exists() else list(location_sites)
 
