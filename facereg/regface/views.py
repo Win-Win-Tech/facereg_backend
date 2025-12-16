@@ -1950,7 +1950,6 @@ class MonthlyAttendanceStatusView(AuthenticatedAPIView):
                 if emp.id in attendance_map and day in attendance_map[emp.id]:
                     status_code = attendance_map[emp.id][day]
                 else:
-                    # if employee has any logs in the month but not on this day => Absent
                     has_any = any(k[0] == emp.id for k in logs_by_key.keys())
                     status_code = "A" if has_any else "-"
                 row[day.strftime("%d-%b")] = status_code

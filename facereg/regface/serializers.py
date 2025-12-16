@@ -253,6 +253,7 @@ class AssignmentSerializer(serializers.ModelSerializer):
     user_name = serializers.CharField(source='user.name', read_only=True)
     shift_name = serializers.CharField(source='shift.shift_name', read_only=True)
     location_name = serializers.CharField(source='location.name', read_only=True)
+    shift = serializers.PrimaryKeyRelatedField(queryset=Shift.objects.all(), allow_null=True, required=False)
 
     class Meta:
         model = Assignment

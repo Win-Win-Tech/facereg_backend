@@ -224,7 +224,7 @@ class Assignment(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     user = models.ForeignKey("Employee", on_delete=models.CASCADE)
     location = models.ForeignKey("Location", on_delete=models.CASCADE)
-    shift = models.ForeignKey("Shift", on_delete=models.CASCADE)
+    shift = models.ForeignKey("Shift", on_delete=models.SET_NULL, null=True, blank=True)
     created_on = models.DateTimeField(auto_now_add=True)
     created_by = models.ForeignKey("User", on_delete=models.SET_NULL, null=True, related_name="created_assignments")
     modified_on = models.DateTimeField(auto_now=True)
