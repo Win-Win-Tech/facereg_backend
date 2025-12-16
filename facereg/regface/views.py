@@ -1022,7 +1022,7 @@ class FaceAttendanceView(APIView):
 
         shift = assignment.shift if assignment else None
         
-        sites = [us.site for us in user_sites] if user_sites.exists() else []
+        sites = [us.site for us in user_sites] if user_sites.exists() else list(location_sites)
 
         # --- Geofence check ---
         lat = float(request.data.get("latitude", 0))
