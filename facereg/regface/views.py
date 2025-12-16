@@ -1086,7 +1086,7 @@ class FaceAttendanceView(APIView):
             nearest_distance = None
 
         # --- Auto checkin/checkout ---
-            logs_today = AttendanceLog.objects.filter(employee=matched_employee, timestamp__date=today)
+        logs_today = AttendanceLog.objects.filter(employee=matched_employee, timestamp__date=today)
         if shift:
             has_checkin = logs_today.filter(type="checkin", shift=shift).exists()
             has_checkout = logs_today.filter(type="checkout", shift=shift).exists()
@@ -1100,8 +1100,8 @@ class FaceAttendanceView(APIView):
             last_log = logs_today.order_by("-timestamp").first()
 
         if not last_log:
-                entry_type = "checkin"
-            else:
+            entry_type = "checkin"
+        else:
             entry_type = "checkout" if last_log.type == "checkin" else "checkin"
 
         # --- Shift timing check ---
@@ -1305,14 +1305,14 @@ class FaceAttendanceView(APIView):
         )
 
         confidence = round(1 - distances[best_match_index], 2)
-            photo_base64 = base64.b64encode(matched_employee.photo).decode("utf-8") if matched_employee.photo else None
+        photo_base64 = base64.b64encode(matched_employee.photo).decode("utf-8") if matched_employee.photo else None
 
-            return Response({
+        return Response({
             "status": status_label,
-                "message": message,
-                "employee": matched_employee.name.strip(),
-                "confidence": confidence,
-                "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
+            "message": message,
+            "employee": matched_employee.name.strip(),
+            "confidence": confidence,
+            "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
             "photo": f"data:image/jpeg;base64,{photo_base64}" if photo_base64 else None,
             "attendance_status": status_label,
             "site_id": str(nearest_site.id) if nearest_site else None,
@@ -1350,7 +1350,6 @@ class FaceAttendanceView(APIView):
             start_dt_naive = datetime.combine(now_local.date(), start_time)
             end_dt_naive = datetime.combine(now_local.date(), end_time)
         else:
-           
             if now_local.time() >= start_time:
                 start_dt_naive = datetime.combine(now_local.date(), start_time)
                 end_dt_naive = datetime.combine(now_local.date() + timedelta(days=1), end_time)
