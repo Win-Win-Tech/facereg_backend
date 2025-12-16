@@ -598,36 +598,53 @@ class PayslipGenerateView(AuthenticatedAPIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
         
-        # TODO: Implement calculation logic
-        # For now, create a basic payslip record
-        # This will be implemented with the calculation engine
+        # Use calculation engine to calculate all field values
+        from .calculation_engine import calculate_payslip_fields, CalculationError
         
-        # Placeholder calculation (will be replaced with proper calculation engine)
-        gross_salary = employee.gross_salary or employee.base_salary or Decimal('0')
-        present_days = 0  # TODO: Calculate from attendance
-        absent_days = 0   # TODO: Calculate from attendance
-        working_days = 30  # TODO: Calculate based on month
+        try:
+            result = calculate_payslip_fields(employee, field_config, month)
+            field_values = result['field_values']
+            total_earnings = result['total_earnings']
+            total_deductions = result['total_deductions']
+            attendance = result['attendance']
+            
+            gross_salary = employee.gross_salary or employee.base_salary or Decimal('0')
+            net_pay = total_earnings - total_deductions
+            
+            record = PayslipRecord.objects.create(
+                employee=employee,
+                field_config=field_config,
+                template=template,
+                month=month,
+                present_days=attendance['present_days'],
+                absent_days=attendance['absent_days'],
+                working_days=attendance['working_days'],
+                gross_salary=gross_salary,
+                total_earnings=total_earnings,
+                total_deductions=total_deductions,
+                net_pay=net_pay,
+                field_values=field_values,
+                generated_by=request.user,
+            )
+        except CalculationError as e:
+            return Response(
+                {"detail": f"Calculation error: {str(e)}"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        except Exception as e:
+            logger.error(f"Error generating payslip: {str(e)}")
+            return Response(
+                {"detail": f"Error generating payslip: {str(e)}"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
         
-        # TODO: Calculate field values using field_config.fields
-        field_values = {}
-        total_earnings = gross_salary
-        total_deductions = Decimal('0')
-        
-        record = PayslipRecord.objects.create(
-            employee=employee,
-            field_config=field_config,
-            template=template,
-            month=month,
-            present_days=present_days,
-            absent_days=absent_days,
-            working_days=working_days,
-            gross_salary=gross_salary,
-            total_earnings=total_earnings,
-            total_deductions=total_deductions,
-            net_pay=total_earnings - total_deductions,
-            field_values=field_values,
-            generated_by=request.user,
-        )
+        # Optionally generate PDF
+        try:
+            from .pdf_generator import save_payslip_pdf
+            save_payslip_pdf(record)
+        except Exception as e:
+            logger.warning(f"Failed to generate PDF for payslip {record.id}: {str(e)}")
+            # Continue even if PDF generation fails
         
         serializer = PayslipRecordSerializer(record)
         return Response(serializer.data, status=status.HTTP_201_CREATED)
@@ -657,12 +674,141 @@ class PayslipBulkGenerateView(AuthenticatedAPIView):
                 status=status.HTTP_404_NOT_FOUND,
             )
         
-        # TODO: Implement bulk generation with calculation engine
-        # For now, return placeholder response
-        return Response(
-            {"detail": "Bulk generation will be implemented with calculation engine."},
-            status=status.HTTP_501_NOT_IMPLEMENTED,
-        )
+        # Get shared field config and template if provided
+        shared_field_config = None
+        if field_config_id:
+            try:
+                shared_field_config = PayslipFieldConfig.objects.get(pk=field_config_id, is_deleted=False)
+            except PayslipFieldConfig.DoesNotExist:
+                return Response(
+                    {"detail": "Field configuration not found."},
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+        
+        shared_template = None
+        if template_id:
+            try:
+                shared_template = PayslipTemplate.objects.get(pk=template_id, is_deleted=False)
+            except PayslipTemplate.DoesNotExist:
+                return Response(
+                    {"detail": "Payslip template not found."},
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+        
+        # Generate payslips for each employee
+        from .calculation_engine import calculate_payslip_fields, CalculationError
+        
+        generated = []
+        errors = []
+        
+        for employee in employees:
+            # Check if payslip already exists
+            if PayslipRecord.objects.filter(employee=employee, month=month).exists():
+                errors.append({
+                    'employee_id': employee.id,
+                    'employee_name': employee.name,
+                    'error': f"Payslip for {month} already exists"
+                })
+                continue
+            
+            # Get field config
+            if shared_field_config:
+                emp_field_config = shared_field_config
+            elif employee.payslip_field_config:
+                emp_field_config = employee.payslip_field_config
+            else:
+                errors.append({
+                    'employee_id': employee.id,
+                    'employee_name': employee.name,
+                    'error': "Employee does not have a payslip field configuration assigned"
+                })
+                continue
+            
+            # Get template
+            emp_location = employee.location
+            if not emp_location:
+                errors.append({
+                    'employee_id': employee.id,
+                    'employee_name': employee.name,
+                    'error': "Employee is not assigned to a location"
+                })
+                continue
+            
+            if shared_template:
+                emp_template = shared_template
+            else:
+                try:
+                    emp_template = PayslipTemplate.objects.get(location=emp_location, is_deleted=False)
+                except PayslipTemplate.DoesNotExist:
+                    errors.append({
+                        'employee_id': employee.id,
+                        'employee_name': employee.name,
+                        'error': "Payslip template not found for employee's location"
+                    })
+                    continue
+            
+            # Calculate and create payslip
+            try:
+                result = calculate_payslip_fields(employee, emp_field_config, month)
+                field_values = result['field_values']
+                total_earnings = result['total_earnings']
+                total_deductions = result['total_deductions']
+                attendance = result['attendance']
+                
+                gross_salary = employee.gross_salary or employee.base_salary or Decimal('0')
+                net_pay = total_earnings - total_deductions
+                
+                record = PayslipRecord.objects.create(
+                    employee=employee,
+                    field_config=emp_field_config,
+                    template=emp_template,
+                    month=month,
+                    present_days=attendance['present_days'],
+                    absent_days=attendance['absent_days'],
+                    working_days=attendance['working_days'],
+                    gross_salary=gross_salary,
+                    total_earnings=total_earnings,
+                    total_deductions=total_deductions,
+                    net_pay=net_pay,
+                    field_values=field_values,
+                    generated_by=request.user,
+                )
+                
+                # Optionally generate PDF
+                try:
+                    from .pdf_generator import save_payslip_pdf
+                    save_payslip_pdf(record)
+                except Exception as e:
+                    logger.warning(f"Failed to generate PDF for payslip {record.id}: {str(e)}")
+                
+                generated.append(record)
+            except CalculationError as e:
+                errors.append({
+                    'employee_id': employee.id,
+                    'employee_name': employee.name,
+                    'error': f"Calculation error: {str(e)}"
+                })
+            except Exception as e:
+                logger.error(f"Error generating payslip for {employee.name}: {str(e)}")
+                errors.append({
+                    'employee_id': employee.id,
+                    'employee_name': employee.name,
+                    'error': f"Error: {str(e)}"
+                })
+        
+        response_data = {
+            'generated_count': len(generated),
+            'errors_count': len(errors),
+            'generated': PayslipRecordSerializer(generated, many=True).data,
+            'errors': errors
+        }
+        
+        if errors and not generated:
+            return Response(response_data, status=status.HTTP_400_BAD_REQUEST)
+        elif errors:
+            return Response(response_data, status=status.HTTP_207_MULTI_STATUS)
+        else:
+            return Response(response_data, status=status.HTTP_201_CREATED)
 
 
 class PayslipApproveView(AuthenticatedAPIView):
@@ -686,105 +832,41 @@ class PayslipApproveView(AuthenticatedAPIView):
         return Response(serializer.data)
 
 
-class PayslipDownloadView(AuthenticatedAPIView):
-    """Download payslip PDF - generates on-demand if not exists"""
+class PayslipPDFView(AuthenticatedAPIView):
+    """Generate or download PDF for a payslip"""
     def get(self, request, pk):
         try:
-            record = PayslipRecord.objects.select_related('employee', 'template', 'field_config').get(pk=pk)
+            record = PayslipRecord.objects.get(pk=pk)
         except PayslipRecord.DoesNotExist:
-            return Response(
-                {"detail": "Payslip not found."},
-                status=status.HTTP_404_NOT_FOUND
-            )
+            return Response(status=status.HTTP_404_NOT_FOUND)
         
         if request.user.role == User.Role.ADMIN:
             if record.employee.location_id != request.user.location_id:
                 return Response(status=status.HTTP_403_FORBIDDEN)
         
-        # Check if PDF file exists
-        if record.pdf_file and record.pdf_file.name:
-            try:
-                # Use the file field directly - Django handles the file path
-                file = record.pdf_file
-                if file.storage.exists(file.name):
-                    response = FileResponse(
-                        file.open('rb'),
-                        content_type='application/pdf'
-                    )
-                    # Sanitize filename for download
-                    safe_filename = f"payslip-{record.month}-{record.employee.name.replace(' ', '_')}.pdf"
-                    response['Content-Disposition'] = f'attachment; filename="{safe_filename}"'
-                    return response
-            except Exception as e:
-                logger.warning(f"Error accessing existing PDF file: {e}, will regenerate")
+        # Generate PDF if not exists or regenerate if requested
+        regenerate = request.query_params.get('regenerate', 'false').lower() == 'true'
         
-        # PDF doesn't exist, generate it on-demand
-        try:
-            # Prepare payslip data for PDF generation
-            payslip_data = {
-                'id': str(record.id),
-                'employee_name': record.employee.name,
-                'employee_id': str(record.employee.id),
-                'employee_email': record.employee.email or '',
-                'month': record.month,
-                'period': record.month,
-                'gross_salary': float(record.gross_salary),
-                'total_earnings': float(record.total_earnings),
-                'total_deductions': float(record.total_deductions),
-                'net_pay': float(record.net_pay),
-                'present_days': record.present_days,
-                'absent_days': record.absent_days,
-                'working_days': record.working_days,
-            }
-            
-            # Add field values from field_values JSON
-            if record.field_values:
-                payslip_data.update(record.field_values)
-            
-            # Prepare template data
-            template_data = None
-            if record.template:
-                template_data = {
-                    'company_name': record.template.company_name or '',
-                    'company_address': record.template.company_address or '',
-                    'company_email': record.template.company_email or '',
-                    'company_phone': record.template.company_phone or '',
-                    'header_text': record.template.header_text or 'PAYSLIP',
-                    'footer_text': record.template.footer_text or 'Confidential - For Employee Use Only',
-                    'header_color': record.template.header_color or '#1e40af',
-                    'footer_color': record.template.footer_color or '#64748b',
-                    'page_size': record.template.page_size or 'A4',
-                    'orientation': record.template.orientation or 'portrait',
-                    'font_size': record.template.font_size or 10,
-                }
-            
-            # Generate PDF
-            pdf_buffer = generate_payslip_pdf(payslip_data, template_data)
-            
-            # Save PDF to record
-            from django.core.files.base import ContentFile
-            filename = f"payslip_{record.month}_{record.employee.id}.pdf"
-            record.pdf_file.save(filename, ContentFile(pdf_buffer.read()), save=True)
-            
-            # Return the PDF
-            pdf_buffer.seek(0)
-            response = FileResponse(
-                pdf_buffer,
-                content_type='application/pdf'
-            )
-            safe_filename = f"payslip-{record.month}-{record.employee.name.replace(' ', '_')}.pdf"
-            response['Content-Disposition'] = f'attachment; filename="{safe_filename}"'
-            return response
-            
-        except ImportError as e:
-            logger.error(f"PDF generation failed - reportlab not installed: {e}")
+        if not record.pdf_file or regenerate:
+            try:
+                from .pdf_generator import save_payslip_pdf
+                save_payslip_pdf(record)
+            except Exception as e:
+                logger.error(f"Failed to generate PDF for payslip {record.id}: {str(e)}")
+                return Response(
+                    {"detail": f"Failed to generate PDF: {str(e)}"},
+                    status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                )
+        
+        # Return PDF file URL
+        if record.pdf_file:
+            pdf_url = request.build_absolute_uri(record.pdf_file.url)
+            return Response({
+                'pdf_url': pdf_url,
+                'download_url': pdf_url
+            })
+        else:
             return Response(
-                {"detail": "PDF generation is not available. Please install reportlab: pip install reportlab"},
-                status=status.HTTP_503_SERVICE_UNAVAILABLE
-            )
-        except Exception as e:
-            logger.error(f"Error generating PDF: {e}", exc_info=True)
-            return Response(
-                {"detail": f"Error generating PDF: {str(e)}"},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+                {"detail": "PDF file not available"},
+                status=status.HTTP_404_NOT_FOUND,
             )

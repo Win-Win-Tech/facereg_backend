@@ -181,7 +181,7 @@ class AttendanceLog(models.Model):
 
     def __str__(self):
         return f"{self.employee.name} - {self.type} at {self.timestamp.strftime('%Y-%m-%d %H:%M:%S')}"
-
+    
 
 class PayrollRecord(models.Model):
     employee = models.ForeignKey("Employee", on_delete=models.CASCADE)

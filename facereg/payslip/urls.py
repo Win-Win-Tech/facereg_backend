@@ -40,5 +40,6 @@ urlpatterns = [
     path('payslips/generate/', PayslipGenerateView.as_view(), name='payslip-generate'),
     path('payslips/generate-bulk/', PayslipBulkGenerateView.as_view(), name='payslip-generate-bulk'),
     path('payslips/<uuid:pk>/approve/', PayslipApproveView.as_view(), name='payslip-approve'),
+    path('payslips/<uuid:pk>/pdf/', PayslipPDFView.as_view(), name='payslip-pdf'),
 ]
 

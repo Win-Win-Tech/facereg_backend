@@ -1002,7 +1002,7 @@ class FaceAttendanceView(APIView):
         for emp in employees:
             if emp.face_encoding:
                 known_encodings.append(np.frombuffer(emp.face_encoding))
-                employee_map.append(emp)
+            employee_map.append(emp)
 
         if not known_encodings:
             return Response({"error": "No registered employees"}, status=status.HTTP_404_NOT_FOUND)
@@ -1012,8 +1012,8 @@ class FaceAttendanceView(APIView):
         if distances[best_match_index] > 0.45:
             return Response({"error": "Face not recognized"}, status=status.HTTP_404_NOT_FOUND)
 
-        matched_employee = employee_map[best_match_index]
-        today = date.today()
+            matched_employee = employee_map[best_match_index]
+            today = date.today()
         now = timezone.now()
 
         # --- Attendance rules ---
@@ -1086,7 +1086,7 @@ class FaceAttendanceView(APIView):
             nearest_distance = None
 
         # --- Auto checkin/checkout ---
-        logs_today = AttendanceLog.objects.filter(employee=matched_employee, timestamp__date=today)
+            logs_today = AttendanceLog.objects.filter(employee=matched_employee, timestamp__date=today)
         if shift:
             has_checkin = logs_today.filter(type="checkin", shift=shift).exists()
             has_checkout = logs_today.filter(type="checkout", shift=shift).exists()
@@ -1100,8 +1100,8 @@ class FaceAttendanceView(APIView):
             last_log = logs_today.order_by("-timestamp").first()
 
         if not last_log:
-            entry_type = "checkin"
-        else:
+                entry_type = "checkin"
+            else:
             entry_type = "checkout" if last_log.type == "checkin" else "checkin"
 
         # --- Shift timing check ---
@@ -1305,20 +1305,20 @@ class FaceAttendanceView(APIView):
         )
 
         confidence = round(1 - distances[best_match_index], 2)
-        photo_base64 = base64.b64encode(matched_employee.photo).decode("utf-8") if matched_employee.photo else None
+            photo_base64 = base64.b64encode(matched_employee.photo).decode("utf-8") if matched_employee.photo else None
 
-        return Response({
+            return Response({
             "status": status_label,
-            "message": message,
-            "employee": matched_employee.name.strip(),
-            "confidence": confidence,
-            "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
+                "message": message,
+                "employee": matched_employee.name.strip(),
+                "confidence": confidence,
+                "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
             "photo": f"data:image/jpeg;base64,{photo_base64}" if photo_base64 else None,
             "attendance_status": status_label,
             "site_id": str(nearest_site.id) if nearest_site else None,
             "location_id": str(matched_employee.location.id),
             "shift_id": str(shift.id) if shift else None,
-        }, status=status.HTTP_200_OK)
+            }, status=status.HTTP_200_OK)
 
     # --- Helpers ---
     def calculate_distance(self, lat, lon, site):
