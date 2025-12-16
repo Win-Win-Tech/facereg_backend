@@ -1905,17 +1905,54 @@ class MonthlyAttendanceStatusView(AuthenticatedAPIView):
         if request.user.role == User.Role.ADMIN:
             logs = logs.filter(employee__location=request.user.location)
 
-        attendance_map = defaultdict(lambda: defaultdict(lambda: "-"))
+        logs_by_key = defaultdict(list)
         for log in logs:
-            attendance_map[log.employee_id][log.timestamp.date()] = "P"
+            try:
+                log_date = log.timestamp.date()
+            except Exception:
+                continue
+            logs_by_key[(log.employee_id, log_date)].append(log)
+
+        attendance_map = defaultdict(dict)
+        for (emp_id, log_date), day_logs in logs_by_key.items():
+            # Determine presence if any checkin or checkout exists
+            types = {l.type for l in day_logs}
+            if 'checkin' in types or 'checkout' in types:
+                # compute worked seconds if both checkin and checkout exist
+                checkins = [l.timestamp for l in day_logs if l.type == 'checkin']
+                checkouts = [l.timestamp for l in day_logs if l.type == 'checkout']
+                worked_seconds = None
+                if checkins and checkouts:
+                    # use earliest checkin and latest checkout
+                    try:
+                        start_ts = min(checkins)
+                        end_ts = max(checkouts)
+                        if timezone.is_naive(start_ts):
+                            start_ts = timezone.make_aware(start_ts, timezone.get_current_timezone())
+                        if timezone.is_naive(end_ts):
+                            end_ts = timezone.make_aware(end_ts, timezone.get_current_timezone())
+                        worked_seconds = (end_ts - start_ts).total_seconds()
+                    except Exception:
+                        worked_seconds = None
+
+                # Mark as Half-day Absent if worked < 4 hours
+                if worked_seconds is not None and worked_seconds < 4 * 3600:
+                    attendance_map[emp_id][log_date] = 'HA'
+                else:
+                    attendance_map[emp_id][log_date] = 'P'
+            else:
+                attendance_map[emp_id][log_date] = 'P'
 
         summary = []
         for emp in employees:
             row = {"name": emp.name}
             for day in date_range:
-                status_code = attendance_map[emp.id].get(
-                    day, "A" if emp.id in attendance_map else "-"
-                )
+                if emp.id in attendance_map and day in attendance_map[emp.id]:
+                    status_code = attendance_map[emp.id][day]
+                else:
+                    # if employee has any logs in the month but not on this day => Absent
+                    has_any = any(k[0] == emp.id for k in logs_by_key.keys())
+                    status_code = "A" if has_any else "-"
                 row[day.strftime("%d-%b")] = status_code
             summary.append(row)
 
