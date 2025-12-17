@@ -14,7 +14,7 @@ from .views import (
     PayslipGenerateView,
     PayslipBulkGenerateView,
     PayslipApproveView,
-    PayslipPDFView,
+    PayslipDownloadView,
 )
 
 urlpatterns = [
@@ -36,10 +36,9 @@ urlpatterns = [
     # Payslip Record APIs
     path('payslips/', PayslipRecordListView.as_view(), name='payslips'),
     path('payslips/<uuid:pk>/', PayslipRecordDetailView.as_view(), name='payslip-detail'),
-    path('payslips/<uuid:pk>/download/', PayslipPDFView.as_view(), name='payslip-download'),
+    path('payslips/<uuid:pk>/download/', PayslipDownloadView.as_view(), name='payslip-download'),
     path('payslips/generate/', PayslipGenerateView.as_view(), name='payslip-generate'),
     path('payslips/generate-bulk/', PayslipBulkGenerateView.as_view(), name='payslip-generate-bulk'),
     path('payslips/<uuid:pk>/approve/', PayslipApproveView.as_view(), name='payslip-approve'),
-    path('payslips/<uuid:pk>/pdf/', PayslipPDFView.as_view(), name='payslip-pdf'),
 ]
 

@@ -1009,11 +1009,11 @@ class FaceAttendanceView(APIView):
 
         distances = face_recognition.face_distance(known_encodings, uploaded_encoding)
         best_match_index = np.argmin(distances)
+        matched_employee = employee_map[best_match_index]
         if distances[best_match_index] > 0.45:
             return Response({"error": "Face not recognized"}, status=status.HTTP_404_NOT_FOUND)
 
-            matched_employee = employee_map[best_match_index]
-            today = date.today()
+        today = date.today()
         now = timezone.now()
 
         # --- Attendance rules ---
