@@ -361,17 +361,42 @@ class EmployeeDetailView(AuthenticatedAPIView):
 
 
 class ShiftListCreateView(AuthenticatedAPIView):
-    """List all non-deleted shifts and create new shifts."""
+
+
     def get(self, request):
-        shifts = Shift.objects.filter(is_deleted=False).order_by('shift_name')
+        shifts = Shift.objects.filter(is_deleted=False)
+
+        location_id = request.query_params.get("location_id")
+        site_id = request.query_params.get("site_id")
+
+        if site_id:
+            shifts = shifts.filter(sites__id=site_id)
+
+        if location_id:
+            shifts = shifts.filter(sites__location_id=location_id)
+
+        shifts = shifts.order_by("shift_name").distinct()
+
         serializer = ShiftSerializer(shifts, many=True)
         return Response(serializer.data)
-    
+
     def post(self, request):
-        serializer = ShiftSerializer(data=request.data)
+        """
+        Create one or many shifts.
+
+        - Single shift: POST /api/shifts/ with a JSON object
+        - Bulk shifts:  POST /api/shifts/ with a JSON array of objects
+        """
+        data = request.data
+        many = isinstance(data, list)
+
+        serializer = ShiftSerializer(data=data, many=many)
         if serializer.is_valid():
-            serializer.save(created_by=request.user)
-            return Response(serializer.data, status=status.HTTP_201_CREATED)
+            shifts = serializer.save(created_by=request.user)
+            return Response(
+                ShiftSerializer(shifts, many=many).data,
+                status=status.HTTP_201_CREATED,
+            )
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 
@@ -415,13 +440,154 @@ class ShiftDetailView(AuthenticatedAPIView):
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
+class SiteBulkShiftAssignView(AuthenticatedAPIView):
+    def post(self, request, pk):
+       
+        try:
+            site = Site.objects.get(pk=pk, is_deleted=False)
+        except Site.DoesNotExist:
+            return Response({"error": "Site not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        # Admin users can only operate within their location
+        if request.user.role == User.Role.ADMIN and site.location_id != request.user.location_id:
+            return Response({"error": "Forbidden"}, status=status.HTTP_403_FORBIDDEN)
+
+        payload = request.data
+        if isinstance(payload, list):
+            shifts_to_create = payload
+            shift_ids = []
+        else:
+            shifts_to_create = payload.get("shifts", []) or []
+            shift_ids = payload.get("shift_ids", []) or []
+
+        created_shifts = []
+        assigned_shifts = []
+
+        # Create new shifts (do NOT set site on Shift; use M2M on Site)
+        if shifts_to_create:
+            serializer = ShiftSerializer(data=shifts_to_create, many=True)
+            if not serializer.is_valid():
+                return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+            for valid in serializer.validated_data:
+                shift_obj = Shift.objects.create(
+                    shift_name=valid.get("shift_name"),
+                    start_time=valid.get("start_time"),
+                    end_time=valid.get("end_time"),
+                    grace_timing=valid.get("grace_timing", 30),
+                    created_by=request.user,
+                    modified_by=request.user,
+                )
+                created_shifts.append(shift_obj)
+                site.shifts.add(shift_obj)
+
+        # Attach existing shifts by IDs to this site (M2M)
+        if shift_ids:
+            # Accept string or list
+            if isinstance(shift_ids, str):
+                shift_ids = [shift_ids]
+            qs = Shift.objects.filter(id__in=shift_ids, is_deleted=False)
+            for shift in qs:
+                site.shifts.add(shift)
+                try:
+                    shift.modified_by = request.user
+                    shift.save(update_fields=["modified_by", "modified_on"])
+                except Exception:
+                    shift.save()
+                assigned_shifts.append(shift)
+
+        result = {
+            "created_count": len(created_shifts),
+            "assigned_count": len(assigned_shifts),
+            "created": ShiftSerializer(created_shifts, many=True).data,
+            "assigned": ShiftSerializer(assigned_shifts, many=True).data,
+        }
+
+        return Response(result, status=status.HTTP_200_OK)
+
+    def put(self, request, pk):
+        """Replace the site's assigned shifts with provided shift ids and/or newly created shifts."""
+        try:
+            site = Site.objects.get(pk=pk, is_deleted=False)
+        except Site.DoesNotExist:
+            return Response({"error": "Site not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        if request.user.role == User.Role.ADMIN and site.location_id != request.user.location_id:
+            return Response({"error": "Forbidden"}, status=status.HTTP_403_FORBIDDEN)
+
+        payload = request.data
+        shifts_to_create = payload.get("shifts", []) or []
+        shift_ids = payload.get("shift_ids", []) or []
+
+        new_shift_objs = []
+        if shifts_to_create:
+            serializer = ShiftSerializer(data=shifts_to_create, many=True)
+            if not serializer.is_valid():
+                return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+            for valid in serializer.validated_data:
+                shift_obj = Shift.objects.create(
+                    shift_name=valid.get("shift_name"),
+                    start_time=valid.get("start_time"),
+                    end_time=valid.get("end_time"),
+                    grace_timing=valid.get("grace_timing", 30),
+                    created_by=request.user,
+                    modified_by=request.user,
+                )
+                new_shift_objs.append(shift_obj)
+
+        # Build final list of shift pks to set
+        final_shift_ids = [str(s.id) for s in new_shift_objs]
+        if isinstance(shift_ids, list):
+            final_shift_ids += [str(s) for s in shift_ids]
+        elif isinstance(shift_ids, str):
+            final_shift_ids.append(shift_ids)
+
+        # Validate provided existing shift ids
+        existing_qs = Shift.objects.filter(id__in=final_shift_ids, is_deleted=False)
+        site.shifts.set(existing_qs)
+
+        return Response({"assigned_count": site.shifts.count()}, status=status.HTTP_200_OK)
+
+    def delete(self, request, pk):
+        """Remove specified shift ids from the site. If no shift_ids provided, clear all."""
+        try:
+            site = Site.objects.get(pk=pk, is_deleted=False)
+        except Site.DoesNotExist:
+            return Response({"error": "Site not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        if request.user.role == User.Role.ADMIN and site.location_id != request.user.location_id:
+            return Response({"error": "Forbidden"}, status=status.HTTP_403_FORBIDDEN)
+
+        shift_ids = request.data.get("shift_ids", None)
+        if shift_ids is None:
+            site.shifts.clear()
+            return Response({"removed": "all"}, status=status.HTTP_200_OK)
+
+        if isinstance(shift_ids, str):
+            shift_ids = [shift_ids]
+
+        qs = Shift.objects.filter(id__in=shift_ids)
+        for s in qs:
+            site.shifts.remove(s)
+
+        return Response({"removed_count": len(shift_ids)}, status=status.HTTP_200_OK)
+
+
 class SiteListCreateView(AuthenticatedAPIView):
-    """List all non-deleted sites and create new sites."""
+ 
     def get(self, request):
-        sites = Site.objects.filter(is_deleted=False).order_by('site_name')
+        sites = Site.objects.filter(is_deleted=False)
+
+        location = request.query_params.get("location")
+        location_id = request.query_params.get("location_id") or location
+
+        if location_id:
+            sites = sites.filter(location_id=location_id)
+
+        sites = sites.order_by("site_name")
+
         serializer = SiteSerializer(sites, many=True)
         return Response(serializer.data)
-    
     def post(self, request):
         serializer = SiteSerializer(data=request.data)
         if serializer.is_valid():
@@ -505,19 +671,13 @@ class AssignmentListCreateView(AuthenticatedAPIView):
 class BulkAssignmentView(AuthenticatedAPIView):
     """Bulk create shift assignments and site assignments for multiple employees."""
     def post(self, request):
-        """
-        Expected request data format:
-        {
-            "employee_ids": [1, 2, 3],
-            "shift_id": "uuid",
-            "location_id": "uuid",
-            "site_ids": ["uuid1", "uuid2"]  # optional
-        }
-        """
+       
         employee_ids = request.data.get('employee_ids', [])
         shift_id = request.data.get('shift_id')
         location_id = request.data.get('location_id')
         site_ids = request.data.get('site_ids', [])
+        assignment_from_date = request.data.get('assignment_from_date')
+        assignment_to_date = request.data.get('assignment_to_date')
         
         # Validation
         if not employee_ids or not isinstance(employee_ids, list):
@@ -556,12 +716,29 @@ class BulkAssignmentView(AuthenticatedAPIView):
         # Verify sites exist if provided
         sites = []
         if site_ids:
-            sites = Site.objects.filter(pk__in=site_ids, is_deleted=False)
+            sites = list(Site.objects.filter(pk__in=site_ids, is_deleted=False).prefetch_related('shifts'))
             if len(sites) != len(site_ids):
                 return Response(
                     {"error": "One or more sites not found"},
                     status=status.HTTP_404_NOT_FOUND
                 )
+
+        if shift is None and sites:
+           
+            site_shift_sets = []
+            for s in sites:
+                ids = set(s.shifts.values_list('id', flat=True))
+                if ids:
+                    site_shift_sets.append(ids)
+
+            if site_shift_sets:
+                common = set.intersection(*site_shift_sets) if len(site_shift_sets) > 1 else site_shift_sets[0]
+                if len(common) == 1:
+                    first = list(common)[0]
+                    try:
+                        shift = Shift.objects.get(pk=first, is_deleted=False)
+                    except Shift.DoesNotExist:
+                        shift = None
         
         # Create assignments
         created_assignments = []
@@ -583,14 +760,16 @@ class BulkAssignmentView(AuthenticatedAPIView):
                 if existing:
                     current_shift_id = existing.shift_id if hasattr(existing, 'shift_id') else (existing.shift.id if existing.shift else None)
                     new_shift_id = shift.id if shift else None
-                    if current_shift_id != new_shift_id:
+                    if current_shift_id != new_shift_id or existing.assignment_from_date != assignment_from_date or existing.assignment_to_date != assignment_to_date:
                         existing.shift = shift
+                        existing.assignment_from_date = assignment_from_date
+                        existing.assignment_to_date = assignment_to_date
                         existing.modified_by = request.user
                         try:
                             existing.modified_on = timezone.now()
                         except Exception:
                             pass
-                        existing.save(update_fields=["shift", "modified_on", "modified_by"])
+                        existing.save(update_fields=["shift", "assignment_from_date", "assignment_to_date", "modified_on", "modified_by"])
                     # Treat existing (created or updated) as an affected assignment
                     created_assignments.append(existing)
                 else:
@@ -598,6 +777,8 @@ class BulkAssignmentView(AuthenticatedAPIView):
                         user_id=employee_id,
                         shift=shift,
                         location_id=location_id,
+                        assignment_from_date=assignment_from_date,
+                        assignment_to_date=assignment_to_date,
                         created_by=request.user
                     )
                     created_assignments.append(assignment)
@@ -1025,14 +1206,11 @@ class FaceAttendanceView(APIView):
         user_sites = UserSite.objects.filter(user_id=matched_employee.id).select_related("site")
         location_sites = Site.objects.filter(location_id=matched_employee.location_id)
 
-        # Treat as no-shift if assignment missing or shift is not defined or missing/invalid times
         shift = None
         if assignment and getattr(assignment, 'shift', None):
             candidate_shift = assignment.shift
             start_time = getattr(candidate_shift, 'start_time', None)
-            end_time = getattr(candidate_shift, 'end_time', None)
-            # Accept only when both start and end are present and non-empty.
-            # This avoids treating an assignment with an incomplete/empty shift as a real shift.
+            end_time = getattr(candidate_shift, 'end_time', None)          
             if start_time not in (None, '') and end_time not in (None, ''):
                 shift = candidate_shift
         
@@ -1080,6 +1258,15 @@ class FaceAttendanceView(APIView):
                     },
                     status=status.HTTP_403_FORBIDDEN,
                 )
+            # If the nearest site has exactly one assigned shift, prefer it over assignment shift
+            try:
+                assigned = list(nearest_site.shifts.all())
+                if len(assigned) == 1:
+                    site_shift = assigned[0]
+                    if getattr(site_shift, 'start_time', None) not in (None, '') and getattr(site_shift, 'end_time', None) not in (None, ''):
+                        shift = site_shift
+            except Exception:
+                pass
         else:
             # No site configured: allow attendance without geofence
             nearest_site = None
@@ -1230,7 +1417,37 @@ class FaceAttendanceView(APIView):
             if entry_type == "checkin":
                 status_label = "Check-in"
             else:
-                status_label = "Check-out"
+                last_checkin = logs_today.filter(type="checkin").order_by("-timestamp").first()
+                if not last_checkin:
+                    status_label = "Absent"
+                else:
+                    tz = timezone.get_current_timezone()
+                    checkin_ts = last_checkin.timestamp
+                    if timezone.is_naive(checkin_ts):
+                        checkin_ts = timezone.make_aware(checkin_ts, tz)
+                    checkin_local = timezone.localtime(checkin_ts)
+                    now_local = timezone.localtime(now) if not timezone.is_naive(now) else timezone.make_aware(now, tz)
+
+                    worked_min = (now_local - checkin_local).total_seconds() / 60.0
+                 
+                    try:
+                        worked_min_val = float(worked_min)
+                    except Exception:
+                        worked_min_val = None
+
+                    if worked_min_val is None:
+                        status_label = "Check-out"
+                    else:
+                        if worked_min_val < 240:
+                            status_label = "Absent"
+                        elif worked_min_val < 360:
+                            status_label = "Half day Absent"
+                        elif worked_min_val < 720:
+                            status_label = "Early Check-out"
+                        elif abs(worked_min_val - 720) < 1.0:
+                            status_label = "On-time Check-out"
+                        else:
+                            status_label = "Delayed Check-out"
 
         emp_name = matched_employee.name.strip()
         if entry_type == "checkin":
@@ -1259,6 +1476,10 @@ class FaceAttendanceView(APIView):
             elif status_label == "Early Check-out":
                 if checkout_delta_min is not None:
                     message = f"Good job today, {emp_name}! You have checked out {abs(checkout_delta_min)} minutes early."
+                elif worked_min is not None:
+                    hours_worked = int(worked_min // 60)
+                    mins_worked = int(worked_min % 60)
+                    message = f"{emp_name}, you have worked {hours_worked} hours {mins_worked} minutes which is less than expected — early check-out."
                 else:
                     message = f"Good job today, {emp_name}! You have checked out early."
             elif status_label == "Late Check-out":
@@ -1275,9 +1496,9 @@ class FaceAttendanceView(APIView):
                 if worked_min is not None:
                     hours_worked = int(worked_min // 60)
                     mins_worked = int(worked_min % 60)
-                    message = f"{emp_name}, you have worked only {hours_worked} hours {mins_worked} minutes, which is less than 4 hours. This will be marked as Half day Absent."
+                    message = f"{emp_name}, you have worked only {hours_worked} hours {mins_worked} minutes, which is less than 6 hours. This will be marked as Half day Absent."
                 else:
-                    message = f"{emp_name}, you have worked less than 4 hours. This will be marked as Half day Absent."
+                    message = f"{emp_name}, you have worked less than 6 hours. This will be marked as Half day Absent."
             elif status_label == "Overtime":
                 if diff_min is not None:
                     message = f"Good job today, {emp_name}! You worked {diff_min} minutes overtime."
@@ -1288,6 +1509,20 @@ class FaceAttendanceView(APIView):
                     message = f"Good job today, {emp_name}! You worked {abs(diff_min)} minutes less than the scheduled shift."
                 else:
                     message = f"Good job today, {emp_name}! You worked less than the scheduled shift."
+            elif status_label == "Absent":
+                if worked_min is not None:
+                    hours_worked = int(worked_min // 60)
+                    mins_worked = int(worked_min % 60)
+                    message = f"{emp_name}, you have worked only {hours_worked} hours {mins_worked} minutes which is insufficient. You will be marked Absent."
+                else:
+                    message = f"{emp_name}, no check-in was found for today. You will be marked Absent."
+            elif status_label == "Delayed Check-out":
+                if worked_min is not None:
+                    hours_worked = int(worked_min // 60)
+                    mins_worked = int(worked_min % 60)
+                    message = f"Good job today, {emp_name}! You worked {hours_worked} hours {mins_worked} minutes — this is beyond the expected 12 hours and will be marked as Delayed Check-out."
+                else:
+                    message = f"Good job today, {emp_name}! You have checked out after an extended period."
             else:
                 message = f"Good job today, {emp_name}! Your check-out is complete."
 
@@ -1522,6 +1757,31 @@ class AttendanceSummaryView(AuthenticatedAPIView):
                 checkin_time = checkin_log.timestamp if checkin_log else None
                 checkout_time = checkout_log.timestamp if checkout_log else None
                 
+                effective_shift = None
+                site_from_log = None
+                if checkin_log and getattr(checkin_log, 'site', None):
+                    site_from_log = getattr(checkin_log, 'site')
+                elif checkout_log and getattr(checkout_log, 'site', None):
+                    site_from_log = getattr(checkout_log, 'site')
+                if site_from_log and getattr(site_from_log, 'shift', None):
+                    s = site_from_log.shift
+                    if getattr(s, 'start_time', None) not in (None, '') and getattr(s, 'end_time', None) not in (None, ''):
+                        effective_shift = s
+                if effective_shift is None:
+                    effective_shift = shift
+
+                # Determine effective shift for this day: prefer site-specific shift from logs, else assignment shift
+                effective_shift = None
+                site_from_log = None
+                if checkin_log and getattr(checkin_log, 'site', None):
+                    site_from_log = getattr(checkin_log, 'site')
+                elif checkout_log and getattr(checkout_log, 'site', None):
+                    site_from_log = getattr(checkout_log, 'site')
+                if site_from_log and getattr(site_from_log, 'shift', None):
+                    s = site_from_log.shift
+                    if getattr(s, 'start_time', None) not in (None, '') and getattr(s, 'end_time', None) not in (None, ''):
+                        effective_shift = s
+
                 # Make times timezone-aware for consistent calculations
                 tz = timezone.get_current_timezone()
                 if checkin_time and timezone.is_naive(checkin_time):
@@ -1546,9 +1806,9 @@ class AttendanceSummaryView(AuthenticatedAPIView):
                             "name": emp.name,
                             "department": emp.department or "—",
                             "location": emp.location.name if emp.location else "—",
-                            "shift": shift.shift_name if shift else "—",
-                            "shift_start": shift.start_time.strftime("%H:%M") if shift else "—",
-                            "shift_end": shift.end_time.strftime("%H:%M") if shift else "—",
+                            "shift": effective_shift.shift_name if effective_shift else (shift.shift_name if shift else "—"),
+                            "shift_start": effective_shift.start_time.strftime("%H:%M") if effective_shift else (shift.start_time.strftime("%H:%M") if shift else "—"),
+                            "shift_end": effective_shift.end_time.strftime("%H:%M") if effective_shift else (shift.end_time.strftime("%H:%M") if shift else "—"),
                             "checkin": "—",
                             "checkout": "—",
                             "duration": "—",
@@ -1556,6 +1816,27 @@ class AttendanceSummaryView(AuthenticatedAPIView):
                             "variance": "—",
                             "remarks": "Absent",
                             "note": "No check-in",
+                        }
+                    )
+                    continue
+
+                if checkin_time and not checkout_time:
+                    summary.append(
+                        {
+                            "date": log_date.strftime("%Y-%m-%d"),
+                            "name": emp.name,
+                            "department": emp.department or "—",
+                            "location": emp.location.name if emp.location else "—",
+                            "shift": effective_shift.shift_name if effective_shift else (shift.shift_name if shift else "—"),
+                            "shift_start": effective_shift.start_time.strftime("%H:%M") if effective_shift else (shift.start_time.strftime("%H:%M") if shift else "—"),
+                            "shift_end": effective_shift.end_time.strftime("%H:%M") if effective_shift else (shift.end_time.strftime("%H:%M") if shift else "—"),
+                            "checkin": checkin_time.strftime("%Y-%m-%d %H:%M:%S") if checkin_time else "—",
+                            "checkout": "—",
+                            "duration": "—",
+                            "status": "Absent",
+                            "variance": "—",
+                            "remarks": "No checkout",
+                            "note": "Only check-in, no checkout",
                         }
                     )
                     continue
@@ -1567,9 +1848,11 @@ class AttendanceSummaryView(AuthenticatedAPIView):
                 status_str = "Present" if checkin_time else "Absent"
                 
                 if shift and checkin_time:
-                    # Shift times
-                    shift_start_time = shift.start_time
-                    shift_end_time = shift.end_time
+                    shift_start_time = effective_shift.start_time if effective_shift else None
+                    shift_end_time = effective_shift.end_time if effective_shift else None
+                    
+                    if shift_start_time is None or shift_end_time is None:
+                        continue
                     
                     # Create aware datetime objects for today
                     shift_start_dt = timezone.make_aware(
@@ -1656,9 +1939,9 @@ class AttendanceSummaryView(AuthenticatedAPIView):
                         "name": emp.name,
                         "department": emp.department or "—",
                         "location": emp.location.name if emp.location else "—",
-                        "shift": shift.shift_name if shift else "—",
-                        "shift_start": shift.start_time.strftime("%H:%M") if shift else "—",
-                        "shift_end": shift.end_time.strftime("%H:%M") if shift else "—",
+                        "shift": effective_shift.shift_name if effective_shift else (shift.shift_name if shift else "—"),
+                        "shift_start": effective_shift.start_time.strftime("%H:%M") if effective_shift else (shift.start_time.strftime("%H:%M") if shift else "—"),
+                        "shift_end": effective_shift.end_time.strftime("%H:%M") if effective_shift else (shift.end_time.strftime("%H:%M") if shift else "—"),
                         "checkin": checkin_time.strftime("%Y-%m-%d %H:%M:%S") if checkin_time else "—",
                         "checkout": checkout_time.strftime("%Y-%m-%d %H:%M:%S") if checkout_time else "—",
                         "duration": duration_str or "—",
@@ -1729,6 +2012,20 @@ class AttendanceSummaryExportView(AuthenticatedAPIView):
                 checkin_time = checkin_log.timestamp if checkin_log else None
                 checkout_time = checkout_log.timestamp if checkout_log else None
                 
+                # Determine effective shift for this day: prefer site-specific shift from logs, else assignment shift
+                effective_shift = None
+                site_from_log = None
+                if checkin_log and getattr(checkin_log, 'site', None):
+                    site_from_log = getattr(checkin_log, 'site')
+                elif checkout_log and getattr(checkout_log, 'site', None):
+                    site_from_log = getattr(checkout_log, 'site')
+                if site_from_log and getattr(site_from_log, 'shift', None):
+                    s = site_from_log.shift
+                    if getattr(s, 'start_time', None) not in (None, '') and getattr(s, 'end_time', None) not in (None, ''):
+                        effective_shift = s
+                if effective_shift is None:
+                    effective_shift = shift
+                
                 # Make times timezone-aware for consistent calculations
                 tz = timezone.get_current_timezone()
                 if checkin_time and timezone.is_naive(checkin_time):
@@ -1752,9 +2049,9 @@ class AttendanceSummaryExportView(AuthenticatedAPIView):
                         emp.location.name if emp.location else "—",
                         emp.name,
                         emp.department or "—",
-                        shift.shift_name if shift else "—",
-                        shift.start_time.strftime("%H:%M") if shift else "—",
-                        shift.end_time.strftime("%H:%M") if shift else "—",
+                        effective_shift.shift_name if effective_shift else (shift.shift_name if shift else "—"),
+                        effective_shift.start_time.strftime("%H:%M") if effective_shift else (shift.start_time.strftime("%H:%M") if shift else "—"),
+                        effective_shift.end_time.strftime("%H:%M") if effective_shift else (shift.end_time.strftime("%H:%M") if shift else "—"),
                         "—",
                         "—",
                         "—",
@@ -1764,6 +2061,25 @@ class AttendanceSummaryExportView(AuthenticatedAPIView):
                         "No check-in",
                     ])
                     continue
+
+                if checkin_time and not checkout_time:
+                    ws.append([
+                        log_date.strftime("%Y-%m-%d"),
+                        emp.location.name if emp.location else "—",
+                        emp.name,
+                        emp.department or "—",
+                        effective_shift.shift_name if effective_shift else (shift.shift_name if shift else "—"),
+                        effective_shift.start_time.strftime("%H:%M") if effective_shift else (shift.start_time.strftime("%H:%M") if shift else "—"),
+                        effective_shift.end_time.strftime("%H:%M") if effective_shift else (shift.end_time.strftime("%H:%M") if shift else "—"),
+                        checkin_time.strftime("%H:%M:%S") if checkin_time else "",
+                        "—",
+                        "—",
+                        "Absent",
+                        "—",
+                        "No checkout",
+                        "No checkout",
+                    ])
+                    continue
                 
                 # Compute variance and remarks
                 variance_str = ""
@@ -1771,10 +2087,10 @@ class AttendanceSummaryExportView(AuthenticatedAPIView):
                 note = ""
                 status_str = "Present" if checkin_time else "Absent"
                 
-                if shift and checkin_time:
-                    # Shift times
-                    shift_start_time = shift.start_time
-                    shift_end_time = shift.end_time
+                if (effective_shift or shift) and checkin_time:
+                    # Shift times (use effective_shift if available)
+                    shift_start_time = (effective_shift.start_time if effective_shift else shift.start_time)
+                    shift_end_time = (effective_shift.end_time if effective_shift else shift.end_time)
                     
                     # Create aware datetime objects for today
                     shift_start_dt = timezone.make_aware(
@@ -1924,9 +2240,14 @@ class MonthlyAttendanceStatusView(AuthenticatedAPIView):
             # Determine presence if any checkin or checkout exists
             types = {l.type for l in day_logs}
             if 'checkin' in types or 'checkout' in types:
-                # compute worked seconds if both checkin and checkout exist
                 checkins = [l.timestamp for l in day_logs if l.type == 'checkin']
                 checkouts = [l.timestamp for l in day_logs if l.type == 'checkout']
+
+                # If there is a check-in but no checkout (or vice versa), mark Absent
+                if (checkins and not checkouts) or (checkouts and not checkins):
+                    attendance_map[emp_id][log_date] = 'A'
+                    continue
+
                 worked_seconds = None
                 if checkins and checkouts:
                     # use earliest checkin and latest checkout
@@ -1947,7 +2268,7 @@ class MonthlyAttendanceStatusView(AuthenticatedAPIView):
                 else:
                     attendance_map[emp_id][log_date] = 'P'
             else:
-                attendance_map[emp_id][log_date] = 'P'
+                attendance_map[emp_id][log_date] = 'A'
 
         summary = []
         for emp in employees:

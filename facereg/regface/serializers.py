@@ -236,17 +236,59 @@ class EmployeeUpdateSerializer(serializers.ModelSerializer):
 class ShiftSerializer(serializers.ModelSerializer):
     class Meta:
         model = Shift
-        fields = '__all__'
-        read_only_fields = ['id', 'created_on', 'modified_on', 'created_by', 'modified_by', 'deleted_by']
+        fields = [
+            "id",
+            "shift_name",
+            "start_time",
+            "end_time",
+            "grace_timing",
+            
+            "created_on",
+            "created_by",
+            "modified_on",
+            "modified_by",
+            "is_deleted",
+            "deleted_by",
+        ]
+        read_only_fields = [
+            "id",
+            "created_on",
+            "modified_on",
+            "created_by",
+            "modified_by",
+            "deleted_by",
+        ]
 
 
 class SiteSerializer(serializers.ModelSerializer):
     location_name = serializers.CharField(source='location.name', read_only=True)
+    shift_ids = serializers.PrimaryKeyRelatedField(source='shifts', many=True, queryset=Shift.objects.all(), required=False)
+    shifts = ShiftSerializer(many=True, read_only=True)
 
     class Meta:
         model = Site
-        fields = '__all__'
+        fields = [
+            'id', 'site_name', 'latitude', 'longitude', 'location', 'location_name',
+            'shift_ids', 'shifts', 'distance_meters', 'created_on', 'created_by',
+            'modified_on', 'modified_by', 'is_deleted', 'deleted_by'
+        ]
         read_only_fields = ['id', 'created_on', 'modified_on', 'created_by', 'modified_by', 'deleted_by']
+
+    def create(self, validated_data):
+        shifts = validated_data.pop('shifts', [])
+        site = Site.objects.create(**validated_data)
+        if shifts:
+            site.shifts.set(shifts)
+        return site
+
+    def update(self, instance, validated_data):
+        shifts = validated_data.pop('shifts', None)
+        for attr, value in validated_data.items():
+            setattr(instance, attr, value)
+        instance.save()
+        if shifts is not None:
+            instance.shifts.set(shifts)
+        return instance
 
 
 class AssignmentSerializer(serializers.ModelSerializer):

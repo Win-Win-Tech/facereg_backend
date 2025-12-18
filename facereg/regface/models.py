@@ -150,6 +150,11 @@ class Site(models.Model):
     latitude = models.DecimalField(max_digits=9, decimal_places=6)
     longitude = models.DecimalField(max_digits=9, decimal_places=6)
     location = models.ForeignKey("Location", on_delete=models.CASCADE, related_name="sites")
+    shifts = models.ManyToManyField(
+        "Shift",
+        related_name="sites",
+        blank=True,
+    )
     distance_meters = models.DecimalField(max_digits=6, decimal_places=2)
     created_on = models.DateTimeField(auto_now_add=True)
     created_by = models.ForeignKey("User", on_delete=models.SET_NULL, null=True, related_name="created_sites")
@@ -225,6 +230,8 @@ class Assignment(models.Model):
     user = models.ForeignKey("Employee", on_delete=models.CASCADE)
     location = models.ForeignKey("Location", on_delete=models.CASCADE)
     shift = models.ForeignKey("Shift", on_delete=models.SET_NULL, null=True, blank=True)
+    assignment_from_date = models.DateField(null=True, blank=True, help_text="Date from which the assignment is effective")
+    assignment_to_date = models.DateField(null=True, blank=True, help_text="Date until which the assignment is effective")
     created_on = models.DateTimeField(auto_now_add=True)
     created_by = models.ForeignKey("User", on_delete=models.SET_NULL, null=True, related_name="created_assignments")
     modified_on = models.DateTimeField(auto_now=True)
@@ -233,7 +240,8 @@ class Assignment(models.Model):
     deleted_by = models.ForeignKey("User", on_delete=models.SET_NULL, null=True, blank=True, related_name="deleted_assignments")
 
     def __str__(self):
-        return f"{self.user.name} - {self.location.name} - {self.shift}"
+        date_range = f" ({self.assignment_from_date} to {self.assignment_to_date})" if self.assignment_from_date or self.assignment_to_date else ""
+        return f"{self.user.name} - {self.location.name} - {self.shift}{date_range}"
 
 
 class UserSite(models.Model):
