@@ -1251,7 +1251,7 @@ class FaceAttendanceView(APIView):
             if nearest_site is None or nearest_distance > allowed_radius:
                 return Response(
                     {
-                        "error": "Outside allowed site radius",
+                        "error": f"Outside allowed site radius ({round(allowed_radius, 2)} m)",
                         "distance_m": round(nearest_distance, 2) if nearest_distance is not None else None,
                         "allowed_radius_m": round(allowed_radius, 2),
                         "site_id": str(nearest_site.id) if nearest_site else None,
@@ -1540,7 +1540,7 @@ class FaceAttendanceView(APIView):
         )
 
         confidence = round(1 - distances[best_match_index], 2)
-        photo_base64 = base64.b64encode(matched_employee.photo).decode("utf-8") if matched_employee.photo else None
+        # photo_base64 = base64.b64encode(matched_employee.photo).decode("utf-8") if matched_employee.photo else None
 
         return Response({
             "status": status_label,
@@ -1548,7 +1548,7 @@ class FaceAttendanceView(APIView):
             "employee": matched_employee.name.strip(),
             "confidence": confidence,
             "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
-            "photo": f"data:image/jpeg;base64,{photo_base64}" if photo_base64 else None,
+            # "photo": f"data:image/jpeg;base64,{photo_base64}" if photo_base64 else None,
             "attendance_status": status_label,
             "site_id": str(nearest_site.id) if nearest_site else None,
             "location_id": str(matched_employee.location.id),
