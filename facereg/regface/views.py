@@ -1818,6 +1818,11 @@ def calculate_attendance_summary(employees, start_date, end_date):
         
         # Build explanation note for multiple entries
         multiple_entries_note = None
+
+        # Determine effective shift for this day: prefer site-specific shift from logs, else assignment shift
+        effective_shift = None
+        site_from_log = None
+
         if has_multiple_entries:
             if checkin_count > 1 and checkout_count > 1:
                 if checkin_count == checkout_count:
@@ -1830,9 +1835,7 @@ def calculate_attendance_summary(employees, start_date, end_date):
             elif checkout_count > 1:
                 multiple_entries_note = f"Multiple check-outs ({checkout_count} total). Duration calculated from {paired_count} valid pair(s) with available check-ins."
 
-            # Determine effective shift for this day: prefer site-specific shift from logs, else assignment shift
-            effective_shift = None
-            site_from_log = None
+
         
         # Prefer earliest checkin site's shift, fallback to latest checkout site's shift
         if earliest_checkin_log and getattr(earliest_checkin_log, 'site', None):
