@@ -19,4 +19,5 @@ facereg/cmake-*/
 .idea/
 .vscode/
 .DS_Store
+facereg/media/
 
