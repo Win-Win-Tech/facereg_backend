@@ -2116,7 +2116,8 @@ class AttendanceSummaryExportView(AuthenticatedAPIView):
         filepath = os.path.join(settings.MEDIA_ROOT, filename)
         wb.save(filepath)
 
-        file_url = request.build_absolute_uri(settings.MEDIA_URL + filename)
+        # file_url = request.build_absolute_uri(settings.MEDIA_URL + filename)
+        file_url = request.build_absolute_uri(settings.MEDIA_URL + filename).replace("http://", "https://")
         return Response({"file_url": file_url})
 
 
