@@ -18,6 +18,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from django.utils import timezone
 from .face_utils import get_face_encoding
+from .face_index import FaceIndexManager
 from .models import AttendanceLog, AuthToken, Employee, Location, PayrollRecord, User, UserSite, Site, Shift, Assignment
 from .serializers import (
     EmployeeRegisterSerializer,
@@ -338,6 +339,8 @@ class EmployeeDetailView(AuthenticatedAPIView):
                 )
             employee.face_encoding = encoding.tobytes()
             updated_fields.append("face_encoding")
+            # Update FAISS Index
+            FaceIndexManager.get_instance().add_employee(employee.id, employee.face_encoding)
 
         if profile_file:
             employee.photo = profile_file.read()
@@ -1172,27 +1175,23 @@ class FaceAttendanceView(APIView):
         if uploaded_encoding is None:
             return Response({"error": "No face detected"}, status=status.HTTP_400_BAD_REQUEST)
 
-        employees = Employee.objects.filter(face_encoding__isnull=False).only(
-            "id", "name", "face_encoding", "photo", "location"
-        )
+        # --- FAISS Comparison ---
+        index_manager = FaceIndexManager.get_instance()
+        matched_id, distance = index_manager.search(uploaded_encoding)
+
+        if not matched_id:
+             return Response({"error": "Face not recognized"}, status=status.HTTP_404_NOT_FOUND)
+             
+        try:
+            matched_employee = Employee.objects.get(id=matched_id)
+        except Employee.DoesNotExist:
+            return Response({"error": "Matched employee not found in DB"}, status=status.HTTP_404_NOT_FOUND)
+
+        # Admin check: Ensure matched employee belongs to the admin's location
         user = getattr(request, "user", None)
         if isinstance(user, User) and user.role == User.Role.ADMIN:
-            employees = employees.filter(location=user.location)
-
-        known_encodings, employee_map = [], []
-        for emp in employees:
-            if emp.face_encoding:
-                known_encodings.append(np.frombuffer(emp.face_encoding))
-            employee_map.append(emp)
-
-        if not known_encodings:
-            return Response({"error": "No registered employees"}, status=status.HTTP_404_NOT_FOUND)
-
-        distances = face_recognition.face_distance(known_encodings, uploaded_encoding)
-        best_match_index = np.argmin(distances)
-        matched_employee = employee_map[best_match_index]
-        if distances[best_match_index] > 0.45:
-            return Response({"error": "Face not recognized"}, status=status.HTTP_404_NOT_FOUND)
+            if matched_employee.location != user.location:
+                 return Response({"error": "Face not recognized (Location mismatch)"}, status=status.HTTP_404_NOT_FOUND)
 
         today = date.today()
         now = timezone.now()
@@ -1539,7 +1538,7 @@ class FaceAttendanceView(APIView):
             # status=status_label (optional if you add field)
         )
 
-        confidence = round(1 - distances[best_match_index], 2)
+        confidence = round(1 - distance, 2)
         # photo_base64 = base64.b64encode(matched_employee.photo).decode("utf-8") if matched_employee.photo else None
 
         return Response({
@@ -1691,6 +1690,11 @@ class RegisterEmployeeView(AuthenticatedAPIView):
         employee_data = {k: v for k, v in employee_data.items() if v is not None or k in ['address', 'notes']}
         
         employee = Employee.objects.create(**employee_data)
+        
+        # Update FAISS Index
+        if employee.face_encoding:
+            FaceIndexManager.get_instance().add_employee(employee.id, employee.face_encoding)
+            
         logger.info("Employee registered: %s", name)
 
         return Response(
@@ -1915,7 +1919,7 @@ def calculate_attendance_summary(employees, start_date, end_date):
             variance_str = "—"
             remarks = "—"
             note = "—"
-            status_str = "Present" if checkin_time else "Absent"
+            status_str = "Present"  # Default to Present, will be overridden by duration logic below
             
             if shift and checkin_time:
                 shift_start_time = effective_shift.start_time if effective_shift else None
@@ -1983,22 +1987,31 @@ def calculate_attendance_summary(employees, start_date, end_date):
                     sign = '-' if variance_seconds < 0 else ''
                     variance_str = f"{sign}{variance_hours:02d}:{variance_mins:02d}"
 
-                    # If total worked time is less than 4 hours => Half day Absent
-                    if worked_seconds is not None and worked_seconds < 4 * 3600:
-                        remarks = "Half day Absent"
-                        wh = int(worked_seconds // 3600)
-                        wm = int((worked_seconds % 3600) // 60)
-                        note = f"Worked {wh}h {wm}m (<4h)"
+                    # --- Duration-based Status Logic ---
+                    wh = int(worked_seconds // 3600)
+                    wm = int((worked_seconds % 3600) // 60)
+                    
+                    if worked_seconds < 3 * 3600:
+                        status_str = "Absent"
+                        remarks = "Absent"
+                        note = f"Worked {wh}h {wm}m (<3h)"
+                    elif worked_seconds < 6 * 3600:
+                        status_str = "Half day Present"
+                        remarks = "Half day Present"
+                        note = f"Worked {wh}h {wm}m (3h-6h)"
                     else:
-                        # Update note with variance details
-                        if abs(variance_seconds) <= 15 * 60:
-                            note = "0 to +/- 15min"
-                        elif abs(variance_seconds) <= 60 * 60:
-                            note = f">15min & <60min"
-                        elif variance_seconds > 0:
-                            note = f">+1hr (Overtime)"
-                        else:
-                            note = f"<-1hr (Undertime)"
+                        status_str = "Present"
+                        # Keep existing note if it was set by variance logic, 
+                        # or update it with variance details
+                        if note == "—":
+                            if abs(variance_seconds) <= 15 * 60:
+                                note = "0 to +/- 15min"
+                            elif abs(variance_seconds) <= 60 * 60:
+                                note = f">15min & <60min"
+                            elif variance_seconds > 0:
+                                note = f">+1hr (Overtime)"
+                            else:
+                                note = f"<-1hr (Undertime)"
                 else:
                     # No checkout, just use checkin variance
                     variance_str = "—"
