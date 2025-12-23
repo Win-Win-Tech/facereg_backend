@@ -55,8 +55,10 @@ class FaceIndexManager:
 
             if best_distance <= threshold and best_index != -1:
                 employee_id = self.employee_map.get(best_index)
+                logger.info(f"FAISS Match Found: Employee ID {employee_id}, Distance {best_distance:.4f}")
                 return employee_id, best_distance
                 
+            logger.info(f"FAISS No Match: Best Distance {best_distance:.4f} (Threshold {threshold})")
             return None, best_distance
         except Exception as e:
             logger.error(f"Error searching FAISS index: {e}")

@@ -1177,6 +1177,7 @@ class FaceAttendanceView(APIView):
 
         # --- FAISS Comparison ---
         index_manager = FaceIndexManager.get_instance()
+        logger.info(f"FAISS Search: Index contains {index_manager.index.ntotal} faces.")
         matched_id, distance = index_manager.search(uploaded_encoding)
 
         if not matched_id:
