@@ -1539,7 +1539,7 @@ class FaceAttendanceView(APIView):
             # status=status_label (optional if you add field)
         )
 
-        confidence = round(1 - distance, 2)
+        confidence = round(1 - np.sqrt(distance), 2)
         # photo_base64 = base64.b64encode(matched_employee.photo).decode("utf-8") if matched_employee.photo else None
 
         return Response({

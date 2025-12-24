@@ -38,7 +38,7 @@ class FaceIndexManager:
         except Exception as e:
             logger.error(f"Error adding employee {employee_id} to FAISS index: {e}")
 
-    def search(self, input_encoding, threshold=0.45):
+    def search(self, input_encoding, threshold=0.25):
         """Searches for the closest match."""
         if self.index.ntotal == 0:
             return None, float('inf')
