@@ -2045,7 +2045,8 @@ def calculate_attendance_summary(employees, start_date, end_date):
 
 class AttendanceSummaryView(AuthenticatedAPIView):
     def get(self, request):
-        today = date.today()
+        today = timezone.now().date()
+        print("today",timezone.now())  # Use timezone-aware date
         start_date = request.query_params.get('start_date', today.strftime('%Y-%m-%d'))
         end_date = request.query_params.get('end_date', today.strftime('%Y-%m-%d'))
         
@@ -2069,7 +2070,7 @@ class AttendanceSummaryView(AuthenticatedAPIView):
 
 class AttendanceSummaryExportView(AuthenticatedAPIView):
     def get(self, request):
-        today = date.today()
+        today = timezone.now().date()  # Use timezone-aware date
         start_date = request.query_params.get('start_date', today.strftime('%Y-%m-%d'))
         end_date = request.query_params.get('end_date', today.strftime('%Y-%m-%d'))
         

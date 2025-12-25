@@ -22,51 +22,189 @@ class CalculationError(Exception):
 
 def calculate_attendance(employee, month):
     """
-    Calculate present_days, absent_days, and working_days for an employee in a month.
+    Enhanced attendance calculation considering:
+    - Manual Attendance (highest priority)
+    - Leave Requests (approved)
+    - Holidays
+    - Weekoffs
+    - Face Recognition Logs
     
     Args:
         employee: Employee instance
         month: Month string in format 'YYYY-MM'
     
     Returns:
-        dict: {'present_days': int, 'absent_days': int, 'working_days': int}
+        dict: {
+            'present_days': float,  # Can be decimal (28.5)
+            'absent_days': float,   # Can be decimal (1.5)
+            'paid_leave_days': int,
+            'unpaid_leave_days': int,
+            'holiday_count': int,
+            'weekoff_count': int,
+            'working_days': int,
+            'total_days': int
+        }
     """
     try:
         year, month_num = map(int, month.split('-'))
-        # Get first and last day of the month
         start_date = datetime(year, month_num, 1).date()
         _, last_day = monthrange(year, month_num)
         end_date = datetime(year, month_num, last_day).date()
         
-        # Get all attendance logs for the employee in this month
-        logs = AttendanceLog.objects.filter(
+        # Initialize counters (use Decimal for half-day support)
+        present_days = Decimal('0')
+        absent_days = Decimal('0')
+        paid_leave_days = 0
+        unpaid_leave_days = 0
+        holiday_count = 0
+        weekoff_count = 0
+        
+        # Import leave models
+        try:
+            from leave.models import ManualAttendance, LeaveRequest, Holiday
+            from leave.utils import is_weekoff_day
+        except ImportError:
+            # If leave module not available, fall back to basic calculation
+            logs = AttendanceLog.objects.filter(
+                employee=employee,
+                timestamp__date__gte=start_date,
+                timestamp__date__lte=end_date,
+                type=AttendanceLog.CHECKIN
+            )
+            present_dates = set(log.timestamp.date() for log in logs)
+            present_days = len(present_dates)
+            working_days = (end_date - start_date).days + 1
+            absent_days = working_days - present_days
+            
+            return {
+                'present_days': float(present_days),
+                'absent_days': float(absent_days),
+                'paid_leave_days': 0,
+                'unpaid_leave_days': 0,
+                'holiday_count': 0,
+                'weekoff_count': 0,
+                'working_days': working_days,
+                'total_days': working_days
+            }
+        
+        # Get all relevant data for the month
+        manual_attendances = ManualAttendance.objects.filter(
+            employee=employee,
+            attendance_date__gte=start_date,
+            attendance_date__lte=end_date
+        ).select_related('leave_request__leave_type')
+        
+        approved_leaves = LeaveRequest.objects.filter(
+            employee=employee,
+            status='APPROVED',
+            start_date__lte=end_date,
+            end_date__gte=start_date
+        ).select_related('leave_type')
+        
+        holidays = Holiday.objects.filter(
+            location=employee.location,
+            holiday_date__gte=start_date,
+            holiday_date__lte=end_date
+        )
+        
+        attendance_logs = AttendanceLog.objects.filter(
             employee=employee,
             timestamp__date__gte=start_date,
             timestamp__date__lte=end_date,
             type=AttendanceLog.CHECKIN
         )
         
-        # Create a set of unique dates with check-ins
-        present_dates = set()
-        for log in logs:
-            present_dates.add(log.timestamp.date())
+        # Create lookup dictionaries
+        manual_dict = {ma.attendance_date: ma for ma in manual_attendances}
+        holiday_set = {h.holiday_date for h in holidays}
+        attendance_set = {log.timestamp.date() for log in attendance_logs}
         
-        # Calculate present and absent days
-        present_days = len(present_dates)
-        working_days = (end_date - start_date).days + 1
-        absent_days = working_days - present_days
+        # Create leave date set
+        leave_dates = {}
+        for leave in approved_leaves:
+            current = leave.start_date
+            while current <= leave.end_date:
+                if start_date <= current <= end_date:
+                    leave_dates[current] = leave
+                current += timedelta(days=1)
+        
+        # Iterate through each day of the month
+        current_date = start_date
+        while current_date <= end_date:
+            # Priority 1: Manual Attendance
+            if current_date in manual_dict:
+                manual = manual_dict[current_date]
+                if manual.status == 'PRESENT':
+                    present_days += Decimal('1')
+                elif manual.status == 'ABSENT':
+                    absent_days += Decimal('1')
+                elif manual.status == 'HALF_DAY':
+                    present_days += Decimal('0.5')  # Half day present
+                    absent_days += Decimal('0.5')   # Half day absent
+                elif manual.status == 'HOLIDAY':
+                    holiday_count += 1
+                elif manual.status == 'WEEKOFF':
+                    weekoff_count += 1
+                elif manual.status == 'LEAVE':
+                    # Check if linked to leave request
+                    if manual.leave_request:
+                        if manual.leave_request.leave_type.is_paid:
+                            paid_leave_days += 1
+                        else:
+                            unpaid_leave_days += 1
+            
+            # Priority 2: Approved Leave
+            elif current_date in leave_dates:
+                leave = leave_dates[current_date]
+                if leave.leave_type.is_paid:
+                    paid_leave_days += 1
+                else:
+                    unpaid_leave_days += 1
+            
+            # Priority 3: Holiday
+            elif current_date in holiday_set:
+                holiday_count += 1
+            
+            # Priority 4: Weekoff
+            elif is_weekoff_day(employee, current_date):
+                weekoff_count += 1
+            
+            # Priority 5: Face Recognition Log
+            elif current_date in attendance_set:
+                present_days += Decimal('1')
+            
+            # Priority 6: Absent
+            else:
+                absent_days += Decimal('1')
+            
+            current_date += timedelta(days=1)
+        
+        # Calculate working days (exclude holidays and weekoffs)
+        total_days = (end_date - start_date).days + 1
+        working_days = total_days - holiday_count - weekoff_count
         
         return {
-            'present_days': present_days,
-            'absent_days': absent_days,
-            'working_days': working_days
+            'present_days': float(present_days),  # Can be decimal like 28.5
+            'absent_days': float(absent_days),    # Can be decimal like 1.5
+            'paid_leave_days': paid_leave_days,
+            'unpaid_leave_days': unpaid_leave_days,
+            'holiday_count': holiday_count,
+            'weekoff_count': weekoff_count,
+            'working_days': working_days,
+            'total_days': total_days
         }
+        
     except (ValueError, AttributeError) as e:
         # If calculation fails, return defaults
         return {
-            'present_days': 0,
-            'absent_days': 0,
-            'working_days': 30  # Default to 30 days
+            'present_days': 0.0,
+            'absent_days': 0.0,
+            'paid_leave_days': 0,
+            'unpaid_leave_days': 0,
+            'holiday_count': 0,
+            'weekoff_count': 0,
+            'working_days': 30,  # Default to 30 days
+            'total_days': 30
         }
 
 
@@ -176,13 +314,26 @@ def calculate_payslip_fields(employee, field_config, month):
     # Get gross salary
     gross_salary = employee.gross_salary or employee.base_salary or Decimal('0')
     
+    # Calculate deduction_per_day based on total calendar days
+    # Formula: gross_salary / total_days (30/31/28/29)
+    total_days = attendance['total_days']
+    if total_days > 0:
+        deduction_per_day = float(gross_salary) / total_days
+    else:
+        deduction_per_day = 0.0
+    
     # Build initial context with employee data
     context = {
         'gross_salary': float(gross_salary),
-        'present_days': attendance['present_days'],
-        'absent_days': attendance['absent_days'],
+        'present_days': attendance['present_days'],  # Can be decimal (28.5)
+        'absent_days': attendance['absent_days'],    # Can be decimal (1.5)
+        'paid_leave_days': attendance['paid_leave_days'],
+        'unpaid_leave_days': attendance['unpaid_leave_days'],
+        'holiday_count': attendance['holiday_count'],
+        'weekoff_count': attendance['weekoff_count'],
         'working_days': attendance['working_days'],
-        'deduction_per_day': float(employee.deduction_per_day or Decimal('0')),
+        'total_days': attendance['total_days'],
+        'deduction_per_day': deduction_per_day,  # Auto-calculated: gross_salary / total_days
         'month': month,
         'base_salary': float(employee.base_salary or Decimal('0')),
     }

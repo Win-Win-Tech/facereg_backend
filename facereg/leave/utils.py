@@ -100,3 +100,51 @@ def is_date_weekoff(check_date, patterns):
     
     return False
 
+
+def is_weekoff_day(employee, check_date):
+    """
+    Check if a given date is a weekoff for the employee.
+    Priority: Employee-specific weekoff > Location weekoff
+    
+    Args:
+        employee: Employee instance
+        check_date: date object to check
+    
+    Returns:
+        bool: True if the date is a weekoff day
+    """
+    from .models import EmployeeWeekoff, LocationWeekoff
+    from django.db import models
+    
+    # Try employee-specific weekoff first
+    try:
+        emp_weekoff = EmployeeWeekoff.objects.filter(
+            employee=employee,
+            is_active=True,
+            effective_from__lte=check_date,
+        ).filter(
+            models.Q(effective_to__isnull=True) | models.Q(effective_to__gte=check_date)
+        ).first()
+        
+        if emp_weekoff and emp_weekoff.weekoff_patterns:
+            return is_date_weekoff(check_date, emp_weekoff.weekoff_patterns)
+    except Exception:
+        pass
+    
+    # Fall back to location weekoff
+    try:
+        loc_weekoff = LocationWeekoff.objects.filter(
+            location=employee.location,
+            is_active=True,
+            effective_from__lte=check_date,
+        ).filter(
+            models.Q(effective_to__isnull=True) | models.Q(effective_to__gte=check_date)
+        ).first()
+        
+        if loc_weekoff and loc_weekoff.weekoff_patterns:
+            return is_date_weekoff(check_date, loc_weekoff.weekoff_patterns)
+    except Exception:
+        pass
+    
+    return False
+

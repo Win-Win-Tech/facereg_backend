@@ -128,10 +128,14 @@ class PayslipRecord(models.Model):
     # Month
     month = models.CharField(max_length=7)  # Format: YYYY-MM
     
-    # Attendance Data
-    present_days = models.IntegerField(default=0)
-    absent_days = models.IntegerField(default=0)
-    working_days = models.IntegerField(default=0)
+    # Attendance Data (Enhanced)
+    present_days = models.DecimalField(max_digits=5, decimal_places=2, default=0)  # Can be 28.5 for half-days
+    absent_days = models.DecimalField(max_digits=5, decimal_places=2, default=0)  # Can be 1.5 for half-days
+    paid_leave_days = models.IntegerField(default=0)  # Approved paid leaves
+    unpaid_leave_days = models.IntegerField(default=0)  # Approved unpaid leaves
+    holiday_count = models.IntegerField(default=0)  # Location holidays
+    weekoff_count = models.IntegerField(default=0)  # Weekoff days
+    working_days = models.IntegerField(default=0)  # Total working days (excludes holidays/weekoffs)
     
     # Calculated Totals
     gross_salary = models.DecimalField(max_digits=10, decimal_places=2)
