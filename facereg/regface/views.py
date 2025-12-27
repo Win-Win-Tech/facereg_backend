@@ -437,6 +437,22 @@ class ShiftDetailView(AuthenticatedAPIView):
         if not shift:
             return Response(status=status.HTTP_404_NOT_FOUND)
         
+        # Check if shift is assigned to any active employees
+        active_assignments_count = Assignment.objects.filter(
+            shift=shift,
+            is_deleted=False
+        ).count()
+        
+        if active_assignments_count > 0:
+            return Response(
+                {
+                    "error": "Cannot delete shift",
+                    "message": f"This shift is currently assigned to {active_assignments_count} employee(s). Please reassign them to a different shift before deleting.",
+                    "assigned_employees_count": active_assignments_count
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
         shift.is_deleted = True
         shift.deleted_by = request.user
         shift.save(update_fields=['is_deleted', 'deleted_by', 'modified_on', 'modified_by'])
@@ -1198,9 +1214,18 @@ class FaceAttendanceView(APIView):
         now = timezone.now()
 
         # --- Attendance rules ---
+        # Filter assignments by valid date range for today
+        from django.db.models import Q
         assignment = Assignment.objects.filter(
             user_id=matched_employee.id,
-            location_id=matched_employee.location_id
+            location_id=matched_employee.location_id,
+            is_deleted=False
+        ).filter(
+            # From date is NULL OR from_date <= today
+            Q(assignment_from_date__isnull=True) | Q(assignment_from_date__lte=today)
+        ).filter(
+            # To date is NULL OR to_date >= today
+            Q(assignment_to_date__isnull=True) | Q(assignment_to_date__gte=today)
         ).select_related("shift").order_by("-created_on").first()
 
         user_sites = UserSite.objects.filter(user_id=matched_employee.id).select_related("site")
@@ -1209,10 +1234,16 @@ class FaceAttendanceView(APIView):
         shift = None
         if assignment and getattr(assignment, 'shift', None):
             candidate_shift = assignment.shift
-            start_time = getattr(candidate_shift, 'start_time', None)
-            end_time = getattr(candidate_shift, 'end_time', None)          
-            if start_time not in (None, '') and end_time not in (None, ''):
-                shift = candidate_shift
+            # Check if shift is deleted
+            is_deleted = getattr(candidate_shift, 'is_deleted', False)
+            if is_deleted:
+                # Shift is deleted, don't use it
+                shift = None
+            else:
+                start_time = getattr(candidate_shift, 'start_time', None)
+                end_time = getattr(candidate_shift, 'end_time', None)          
+                if start_time not in (None, '') and end_time not in (None, ''):
+                    shift = candidate_shift
         
         sites = [us.site for us in user_sites] if user_sites.exists() else list(location_sites)
 
@@ -1260,7 +1291,7 @@ class FaceAttendanceView(APIView):
                 )
             # If the nearest site has exactly one assigned shift, prefer it over assignment shift
             try:
-                assigned = list(nearest_site.shifts.all())
+                assigned = list(nearest_site.shifts.filter(is_deleted=False))
                 if len(assigned) == 1:
                     site_shift = assigned[0]
                     if getattr(site_shift, 'start_time', None) not in (None, '') and getattr(site_shift, 'end_time', None) not in (None, ''):
@@ -1316,6 +1347,23 @@ class FaceAttendanceView(APIView):
                 end_dt_naive = datetime.combine(now_local.date() + timedelta(days=1), end_time)
             start_dt = timezone.make_aware(start_dt_naive, tz)
             end_dt = timezone.make_aware(end_dt_naive, tz)
+
+            # ±1 hour window restriction: Allow attendance 1 hour before shift start to 1 hour after shift end
+            # Example: Shift 7am-7pm allows attendance from 6am-8pm
+            window_start = start_dt - timedelta(hours=1)
+            window_end = end_dt + timedelta(hours=1)
+            
+            if now_local < window_start or now_local > window_end:
+                return Response(
+                    {
+                        "error": "Attendance not allowed outside shift window",
+                        "message": f"You can only mark attendance between {window_start.strftime('%I:%M %p')} and {window_end.strftime('%I:%M %p')}",
+                        "shift_time": f"{start_time.strftime('%I:%M %p')} - {end_time.strftime('%I:%M %p')}",
+                        "allowed_window": f"{window_start.strftime('%I:%M %p')} - {window_end.strftime('%I:%M %p')}",
+                        "current_time": now_local.strftime('%I:%M %p')
+                    },
+                    status=status.HTTP_403_FORBIDDEN
+                )
 
             logger.info(f"DEBUG: start_time={start_time}, end_time={end_time}, now_local.time()={now_local.time()}")
             logger.info(f"DEBUG: start_dt={start_dt}, end_dt={end_dt}, now_local={now_local}")
@@ -1725,6 +1773,8 @@ def calculate_attendance_summary(employees, start_date, end_date):
         all_dates.append(current_date)
         current_date += timedelta(days=1)
 
+    from django.db.models import Q
+    
     for emp in employees:
         logs = emp.attendancelog_set.filter(
             timestamp__date__range=(start_date, end_date)
@@ -1736,128 +1786,148 @@ def calculate_attendance_summary(employees, start_date, end_date):
             log_date = log.timestamp.date()
             logs_by_date[log_date].append(log)
         
-        # Get employee's shift assignment
-        assignment = Assignment.objects.filter(
-            user_id=emp.id,
-            location_id=emp.location_id,
-            is_deleted=False
-        ).select_related('shift', 'location').first()
-        
-        shift = assignment.shift if assignment else None
-        
         # Process each date in range (including dates with no logs)
         for log_date in all_dates:
-            date_logs = logs_by_date.get(log_date, [])
-        
-        # Separate checkins and checkouts, sorted by timestamp
-        checkin_logs = sorted([log for log in date_logs if log.type == 'checkin'], key=lambda x: x.timestamp)
-        checkout_logs = sorted([log for log in date_logs if log.type == 'checkout'], key=lambda x: x.timestamp)
-        
-        # Get earliest checkin and latest checkout for display
-        earliest_checkin_log = checkin_logs[0] if checkin_logs else None
-        latest_checkout_log = checkout_logs[-1] if checkout_logs else None
-        
-        # For display purposes (return in response)
-        checkin_time = earliest_checkin_log.timestamp if earliest_checkin_log else None
-        checkout_time = latest_checkout_log.timestamp if latest_checkout_log else None
-        
-        # Track multiple entries info
-        checkin_count = len(checkin_logs)
-        checkout_count = len(checkout_logs)
-        has_multiple_entries = (checkin_count > 1) or (checkout_count > 1)
-        
-        # Calculate total duration by pairing checkins with checkouts sequentially
-        total_worked_seconds = 0
-        paired_count = 0
-        pair_details = []  # Store details of each valid pair
-        
-        # Pair checkins with checkouts sequentially
-        min_pairs = min(len(checkin_logs), len(checkout_logs))
-        
-        for i in range(min_pairs):
-            checkin_log = checkin_logs[i]
-            checkout_log = checkout_logs[i]
+            # Get employee's shift assignment for this specific date
+            assignment = Assignment.objects.filter(
+                user_id=emp.id,
+                location_id=emp.location_id,
+                is_deleted=False
+            ).filter(
+                Q(assignment_from_date__isnull=True) | Q(assignment_from_date__lte=log_date),
+                Q(assignment_to_date__isnull=True) | Q(assignment_to_date__gte=log_date),
+            ).select_related("shift").order_by("-assignment_from_date").first()
+
+            if assignment:
+                # Check if there are multiple overlapping assignments (for warning)
+                overlapping_count = Assignment.objects.filter(
+                    user_id=emp.id,
+                    location_id=emp.location_id,
+                    is_deleted=False
+                ).filter(
+                    Q(assignment_from_date__isnull=True) | Q(assignment_from_date__lte=log_date),
+                    Q(assignment_to_date__isnull=True) | Q(assignment_to_date__gte=log_date),
+                ).count()
+                
+                if overlapping_count > 1:
+                    # log warning / add note in report
+                    overlap_warning = f"{overlapping_count} overlapping assignments on {log_date}"
             
-            # Ensure checkout comes after checkin (valid pair)
-            if checkout_log.timestamp > checkin_log.timestamp:
-                # Make timezone-aware
-                tz = timezone.get_current_timezone()
-                checkin_ts = checkin_log.timestamp
-                checkout_ts = checkout_log.timestamp
+            shift = assignment.shift if assignment else None
+            date_logs = logs_by_date.get(log_date, [])
+            
+            # Separate checkins and checkouts, sorted by timestamp
+            checkin_logs = sorted([log for log in date_logs if log.type == 'checkin'], key=lambda x: x.timestamp)
+            checkout_logs = sorted([log for log in date_logs if log.type == 'checkout'], key=lambda x: x.timestamp)
+            
+            # Get earliest checkin and latest checkout for display
+            earliest_checkin_log = checkin_logs[0] if checkin_logs else None
+            latest_checkout_log = checkout_logs[-1] if checkout_logs else None
+            
+            # For display purposes (return in response)
+            checkin_time = earliest_checkin_log.timestamp if earliest_checkin_log else None
+            checkout_time = latest_checkout_log.timestamp if latest_checkout_log else None
+            
+            # Track multiple entries info
+            checkin_count = len(checkin_logs)
+            checkout_count = len(checkout_logs)
+            has_multiple_entries = (checkin_count > 1) or (checkout_count > 1)
+            
+            # Calculate total duration by pairing checkins with checkouts sequentially
+            total_worked_seconds = 0
+            paired_count = 0
+            pair_details = []  # Store details of each valid pair
+            
+            # Pair checkins with checkouts sequentially
+            min_pairs = min(len(checkin_logs), len(checkout_logs))
+            
+            for i in range(min_pairs):
+                checkin_log = checkin_logs[i]
+                checkout_log = checkout_logs[i]
                 
-                if timezone.is_naive(checkin_ts):
-                    checkin_ts = timezone.make_aware(checkin_ts, tz)
-                if timezone.is_naive(checkout_ts):
-                    checkout_ts = timezone.make_aware(checkout_ts, tz)
-                
-                # Calculate duration for this pair
-                pair_duration = (checkout_ts - checkin_ts).total_seconds()
-                
-                # Only add positive durations (safety check)
-                if pair_duration > 0:
-                    total_worked_seconds += pair_duration
-                    paired_count += 1
+                # Ensure checkout comes after checkin (valid pair)
+                if checkout_log.timestamp > checkin_log.timestamp:
+                    # Make timezone-aware
+                    tz = timezone.get_current_timezone()
+                    checkin_ts = checkin_log.timestamp
+                    checkout_ts = checkout_log.timestamp
                     
-                    # Store pair details for frontend
-                    hours = int(pair_duration // 3600)
-                    minutes = int((pair_duration % 3600) // 60)
-                    pair_details.append({
-                        "pair_number": paired_count,
-                        "checkin": checkin_log.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
-                        "checkout": checkout_log.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
-                        "duration": f"{hours:02d}:{minutes:02d}",
-                        "duration_seconds": int(pair_duration)
-                    })
-        
-        # Format total duration
-        duration_str = None
-        worked_seconds = None
-        if total_worked_seconds > 0:
-            worked_seconds = total_worked_seconds
-            hours = int(worked_seconds // 3600)
-            minutes = int((worked_seconds % 3600) // 60)
-            duration_str = f"{hours:02d}:{minutes:02d}"
-        else:
+                    if timezone.is_naive(checkin_ts):
+                        checkin_ts = timezone.make_aware(checkin_ts, tz)
+                    if timezone.is_naive(checkout_ts):
+                        checkout_ts = timezone.make_aware(checkout_ts, tz)
+                    
+                    # Calculate duration for this pair
+                    pair_duration = (checkout_ts - checkin_ts).total_seconds()
+                    
+                    # Only add positive durations (safety check)
+                    if pair_duration > 0:
+                        total_worked_seconds += pair_duration
+                        paired_count += 1
+                        
+                        # Store pair details for frontend
+                        hours = int(pair_duration // 3600)
+                        minutes = int((pair_duration % 3600) // 60)
+                        pair_details.append({
+                            "pair_number": paired_count,
+                            "checkin": checkin_log.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+                            "checkout": checkout_log.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+                            "duration": f"{hours:02d}:{minutes:02d}",
+                            "duration_seconds": int(pair_duration)
+                        })
+            
+            # Format total duration
+            duration_str = None
             worked_seconds = None
-            duration_str = "—"
-        
-        # Build explanation note for multiple entries
-        multiple_entries_note = None
+            if total_worked_seconds > 0:
+                worked_seconds = total_worked_seconds
+                hours = int(worked_seconds // 3600)
+                minutes = int((worked_seconds % 3600) // 60)
+                duration_str = f"{hours:02d}:{minutes:02d}"
+            else:
+                worked_seconds = None
+                duration_str = "—"
+            
+            # Build explanation note for multiple entries
+            multiple_entries_note = None
 
-        # Determine effective shift for this day: prefer site-specific shift from logs, else assignment shift
-        effective_shift = None
-        site_from_log = None
+            # Determine effective shift for this day: prefer site-specific shift from logs, else assignment shift
+            effective_shift = None
+            site_from_log = None
 
-        if has_multiple_entries:
-            if checkin_count > 1 and checkout_count > 1:
-                if checkin_count == checkout_count:
-                    multiple_entries_note = f"Multiple entries: {checkin_count} check-ins and {checkout_count} check-outs. Duration calculated from {paired_count} valid pair(s)."
-                else:
-                    unmatched = abs(checkin_count - checkout_count)
-                    multiple_entries_note = f"Multiple entries: {checkin_count} check-ins and {checkout_count} check-outs ({unmatched} unmatched). Duration calculated from {paired_count} valid pair(s)."
-            elif checkin_count > 1:
-                multiple_entries_note = f"Multiple check-ins ({checkin_count} total). Duration calculated from {paired_count} valid pair(s) with available check-outs."
-            elif checkout_count > 1:
-                multiple_entries_note = f"Multiple check-outs ({checkout_count} total). Duration calculated from {paired_count} valid pair(s) with available check-ins."
+            if has_multiple_entries:
+                if checkin_count > 1 and checkout_count > 1:
+                    if checkin_count == checkout_count:
+                        multiple_entries_note = f"Multiple entries: {checkin_count} check-ins and {checkout_count} check-outs. Duration calculated from {paired_count} valid pair(s)."
+                    else:
+                        unmatched = abs(checkin_count - checkout_count)
+                        multiple_entries_note = f"Multiple entries: {checkin_count} check-ins and {checkout_count} check-outs ({unmatched} unmatched). Duration calculated from {paired_count} valid pair(s)."
+                elif checkin_count > 1:
+                    multiple_entries_note = f"Multiple check-ins ({checkin_count} total). Duration calculated from {paired_count} valid pair(s) with available check-outs."
+                elif checkout_count > 1:
+                    multiple_entries_note = f"Multiple check-outs ({checkout_count} total). Duration calculated from {paired_count} valid pair(s) with available check-ins."
 
+            # Prefer earliest checkin site's shift, fallback to latest checkout site's shift
+            if earliest_checkin_log and getattr(earliest_checkin_log, 'site', None):
+                site_from_log = getattr(earliest_checkin_log, 'site')
+            elif latest_checkout_log and getattr(latest_checkout_log, 'site', None):
+                site_from_log = getattr(latest_checkout_log, 'site')
+            
+            # Get shift from site if available (Site has ManyToMany with Shift)
+            if site_from_log:
+                try:
+                    assigned_shifts = list(site_from_log.shifts.filter(is_deleted=False))
+                    if len(assigned_shifts) == 1:
+                        s = assigned_shifts[0]
+                        if getattr(s, 'start_time', None) not in (None, '') and getattr(s, 'end_time', None) not in (None, ''):
+                            effective_shift = s
+                except Exception:
+                    pass
 
-        
-        # Prefer earliest checkin site's shift, fallback to latest checkout site's shift
-        if earliest_checkin_log and getattr(earliest_checkin_log, 'site', None):
-            site_from_log = getattr(earliest_checkin_log, 'site')
-        elif latest_checkout_log and getattr(latest_checkout_log, 'site', None):
-            site_from_log = getattr(latest_checkout_log, 'site')
-        
-        # Get shift from site if available
-            if site_from_log and getattr(site_from_log, 'shift', None):
-                s = site_from_log.shift
-                if getattr(s, 'start_time', None) not in (None, '') and getattr(s, 'end_time', None) not in (None, ''):
-                    effective_shift = s
-
-        # Fallback to assignment shift
-        if effective_shift is None:
-            effective_shift = shift
-        
+            # Fallback to assignment shift
+            if effective_shift is None:
+                effective_shift = shift
+            
             # Make times timezone-aware for consistent calculations
             tz = timezone.get_current_timezone()
             if checkin_time and timezone.is_naive(checkin_time):
@@ -1868,20 +1938,20 @@ def calculate_attendance_summary(employees, start_date, end_date):
             # If no checkin on this day, mark as Absent
             if not checkin_time:
                 summary.append({
-                            "date": log_date.strftime("%Y-%m-%d"),
-                            "name": emp.name,
-                            "department": emp.department or "—",
-                            "location": emp.location.name if emp.location else "—",
-                            "shift": effective_shift.shift_name if effective_shift else (shift.shift_name if shift else "—"),
-                            "shift_start": effective_shift.start_time.strftime("%H:%M") if effective_shift else (shift.start_time.strftime("%H:%M") if shift else "—"),
-                            "shift_end": effective_shift.end_time.strftime("%H:%M") if effective_shift else (shift.end_time.strftime("%H:%M") if shift else "—"),
-                            "checkin": "—",
-                            "checkout": "—",
-                            "duration": "—",
-                            "status": "Absent",
-                            "variance": "—",
-                            "remarks": "Absent",
-                            "note": "No check-in",
+                    "date": log_date.strftime("%Y-%m-%d"),
+                    "name": emp.name,
+                    "department": emp.department or "—",
+                    "location": emp.location.name if emp.location else "—",
+                    "shift": effective_shift.shift_name if effective_shift else (shift.shift_name if shift else "—"),
+                    "shift_start": effective_shift.start_time.strftime("%H:%M") if effective_shift else (shift.start_time.strftime("%H:%M") if shift else "—"),
+                    "shift_end": effective_shift.end_time.strftime("%H:%M") if effective_shift else (shift.end_time.strftime("%H:%M") if shift else "—"),
+                    "checkin": "—",
+                    "checkout": "—",
+                    "duration": "—",
+                    "status": "Absent",
+                    "variance": "—",
+                    "remarks": "Absent",
+                    "note": "No check-in",
                     "has_multiple_entries": False,
                     "checkin_count": 0,
                     "checkout_count": 0,
@@ -1893,20 +1963,20 @@ def calculate_attendance_summary(employees, start_date, end_date):
 
             if checkin_time and not checkout_time:
                 summary.append({
-                            "date": log_date.strftime("%Y-%m-%d"),
-                            "name": emp.name,
-                            "department": emp.department or "—",
-                            "location": emp.location.name if emp.location else "—",
-                            "shift": effective_shift.shift_name if effective_shift else (shift.shift_name if shift else "—"),
-                            "shift_start": effective_shift.start_time.strftime("%H:%M") if effective_shift else (shift.start_time.strftime("%H:%M") if shift else "—"),
-                            "shift_end": effective_shift.end_time.strftime("%H:%M") if effective_shift else (shift.end_time.strftime("%H:%M") if shift else "—"),
-                            "checkin": checkin_time.strftime("%Y-%m-%d %H:%M:%S") if checkin_time else "—",
-                            "checkout": "—",
-                            "duration": "—",
-                            "status": "Absent",
-                            "variance": "—",
-                            "remarks": "No checkout",
-                            "note": "Only check-in, no checkout",
+                    "date": log_date.strftime("%Y-%m-%d"),
+                    "name": emp.name,
+                    "department": emp.department or "—",
+                    "location": emp.location.name if emp.location else "—",
+                    "shift": effective_shift.shift_name if effective_shift else (shift.shift_name if shift else "—"),
+                    "shift_start": effective_shift.start_time.strftime("%H:%M") if effective_shift else (shift.start_time.strftime("%H:%M") if shift else "—"),
+                    "shift_end": effective_shift.end_time.strftime("%H:%M") if effective_shift else (shift.end_time.strftime("%H:%M") if shift else "—"),
+                    "checkin": checkin_time.strftime("%Y-%m-%d %H:%M:%S") if checkin_time else "—",
+                    "checkout": "—",
+                    "duration": "—",
+                    "status": "Absent",
+                    "variance": "—",
+                    "remarks": "No checkout",
+                    "note": "Only check-in, no checkout",
                     "has_multiple_entries": has_multiple_entries,
                     "checkin_count": checkin_count,
                     "checkout_count": checkout_count,
@@ -1927,6 +1997,29 @@ def calculate_attendance_summary(employees, start_date, end_date):
                 shift_end_time = effective_shift.end_time if effective_shift else None
                 
                 if shift_start_time is None or shift_end_time is None:
+                    # No valid shift times, skip variance calculation
+                    summary.append({
+                        "date": log_date.strftime("%Y-%m-%d"),
+                        "name": emp.name,
+                        "department": emp.department or "—",
+                        "location": emp.location.name if emp.location else "—",
+                        "shift": effective_shift.shift_name if effective_shift else (shift.shift_name if shift else "—"),
+                        "shift_start": "—",
+                        "shift_end": "—",
+                        "checkin": checkin_time.strftime("%Y-%m-%d %H:%M:%S") if checkin_time else "—",
+                        "checkout": checkout_time.strftime("%Y-%m-%d %H:%M:%S") if checkout_time else "—",
+                        "duration": duration_str or "—",
+                        "status": status_str,
+                        "variance": variance_str,
+                        "remarks": remarks,
+                        "note": "No valid shift times",
+                        "has_multiple_entries": has_multiple_entries,
+                        "checkin_count": checkin_count,
+                        "checkout_count": checkout_count,
+                        "valid_pairs_count": paired_count,
+                        "pair_details": pair_details,
+                        "multiple_entries_note": multiple_entries_note,
+                    })
                     continue
                 
                 # Create aware datetime objects for today
@@ -1982,56 +2075,57 @@ def calculate_attendance_summary(employees, start_date, end_date):
                         note = f"{checkout_variance_minutes}min early"
                     
                     # Compute variance as worked - shift duration
-                    variance_seconds = worked_seconds - shift_duration_seconds
-                    variance_hours = int(abs(variance_seconds) // 3600)
-                    variance_mins = int((abs(variance_seconds) % 3600) // 60)
-                    sign = '-' if variance_seconds < 0 else ''
-                    variance_str = f"{sign}{variance_hours:02d}:{variance_mins:02d}"
+                    if worked_seconds is not None:
+                        variance_seconds = worked_seconds - shift_duration_seconds
+                        variance_hours = int(abs(variance_seconds) // 3600)
+                        variance_mins = int((abs(variance_seconds) % 3600) // 60)
+                        sign = '-' if variance_seconds < 0 else ''
+                        variance_str = f"{sign}{variance_hours:02d}:{variance_mins:02d}"
 
-                    # --- Duration-based Status Logic ---
-                    wh = int(worked_seconds // 3600)
-                    wm = int((worked_seconds % 3600) // 60)
-                    
-                    if worked_seconds < 3 * 3600:
-                        status_str = "Absent"
-                        remarks = "Absent"
-                        note = f"Worked {wh}h {wm}m (<3h)"
-                    elif worked_seconds < 6 * 3600:
-                        status_str = "Half day Present"
-                        remarks = "Half day Present"
-                        note = f"Worked {wh}h {wm}m (3h-6h)"
-                    else:
-                        status_str = "Present"
-                        # Keep existing note if it was set by variance logic, 
-                        # or update it with variance details
-                        if note == "—":
-                            if abs(variance_seconds) <= 15 * 60:
-                                note = "0 to +/- 15min"
-                            elif abs(variance_seconds) <= 60 * 60:
-                                note = f">15min & <60min"
-                            elif variance_seconds > 0:
-                                note = f">+1hr (Overtime)"
-                            else:
-                                note = f"<-1hr (Undertime)"
+                        # --- Duration-based Status Logic ---
+                        wh = int(worked_seconds // 3600)
+                        wm = int((worked_seconds % 3600) // 60)
+                        
+                        if worked_seconds < 3 * 3600:
+                            status_str = "Absent"
+                            remarks = "Absent"
+                            note = f"Worked {wh}h {wm}m (<3h)"
+                        elif worked_seconds < 6 * 3600:
+                            status_str = "Half day Present"
+                            remarks = "Half day Present"
+                            note = f"Worked {wh}h {wm}m (3h-6h)"
+                        else:
+                            status_str = "Present"
+                            # Keep existing note if it was set by variance logic, 
+                            # or update it with variance details
+                            if note == "—":
+                                if abs(variance_seconds) <= 15 * 60:
+                                    note = "0 to +/- 15min"
+                                elif abs(variance_seconds) <= 60 * 60:
+                                    note = f">15min & <60min"
+                                elif variance_seconds > 0:
+                                    note = f">+1hr (Overtime)"
+                                else:
+                                    note = f"<-1hr (Undertime)"
                 else:
                     # No checkout, just use checkin variance
                     variance_str = "—"
             
             summary.append({
-                        "date": log_date.strftime("%Y-%m-%d"),
-                        "name": emp.name,
-                        "department": emp.department or "—",
-                        "location": emp.location.name if emp.location else "—",
-                        "shift": effective_shift.shift_name if effective_shift else (shift.shift_name if shift else "—"),
-                        "shift_start": effective_shift.start_time.strftime("%H:%M") if effective_shift else (shift.start_time.strftime("%H:%M") if shift else "—"),
-                        "shift_end": effective_shift.end_time.strftime("%H:%M") if effective_shift else (shift.end_time.strftime("%H:%M") if shift else "—"),
-                        "checkin": checkin_time.strftime("%Y-%m-%d %H:%M:%S") if checkin_time else "—",
-                        "checkout": checkout_time.strftime("%Y-%m-%d %H:%M:%S") if checkout_time else "—",
-                        "duration": duration_str or "—",
-                        "status": status_str,
-                        "variance": variance_str,
-                        "remarks": remarks,
-                        "note": note,
+                "date": log_date.strftime("%Y-%m-%d"),
+                "name": emp.name,
+                "department": emp.department or "—",
+                "location": emp.location.name if emp.location else "—",
+                "shift": effective_shift.shift_name if effective_shift else (shift.shift_name if shift else "—"),
+                "shift_start": effective_shift.start_time.strftime("%H:%M") if effective_shift else (shift.start_time.strftime("%H:%M") if shift else "—"),
+                "shift_end": effective_shift.end_time.strftime("%H:%M") if effective_shift else (shift.end_time.strftime("%H:%M") if shift else "—"),
+                "checkin": checkin_time.strftime("%Y-%m-%d %H:%M:%S") if checkin_time else "—",
+                "checkout": checkout_time.strftime("%Y-%m-%d %H:%M:%S") if checkout_time else "—",
+                "duration": duration_str or "—",
+                "status": status_str,
+                "variance": variance_str,
+                "remarks": remarks,
+                "note": note,
                 "has_multiple_entries": has_multiple_entries,
                 "checkin_count": checkin_count,
                 "checkout_count": checkout_count,
@@ -2099,12 +2193,15 @@ class AttendanceSummaryExportView(AuthenticatedAPIView):
         ws.append([
             "Date", "Location", "Name", "Department", "Shift", "Shift Start", "Shift End",
             "Check-in", "Check-out", "Duration", "Status", "Variance", "Remarks", "Note",
-            "Has Multiple Entries", "Check-in Count", "Check-out Count", "Valid Pairs",
-            "Multiple Entries Note"
+            "PunchRecords",  # New column for all check-in/checkout details
+            "Has Multiple Entries", "Check-in Count", "Check-out Count",
         ])
-        
+        #"Valid Pairs","Multiple Entries Note"
         # Add data rows
         for row_data in summary:
+            # Build PunchRecords column - all check-in/checkout sessions with durations
+            punch_records = self._build_punch_records(row_data)
+            
             ws.append([
                 row_data["date"],
                 row_data["location"],
@@ -2120,12 +2217,79 @@ class AttendanceSummaryExportView(AuthenticatedAPIView):
                 row_data["variance"],
                 row_data["remarks"],
                 row_data["note"],
+                punch_records,  # New PunchRecords column
                 "Yes" if row_data["has_multiple_entries"] else "No",
                 row_data["checkin_count"],
                 row_data["checkout_count"],
-                row_data["valid_pairs_count"],
-                row_data["multiple_entries_note"] or "",
+                # row_data["valid_pairs_count"],
+                # row_data["multiple_entries_note"] or "",
             ])
+        
+        # Generate filename with date range
+        filename = f"attendance_summary_{start_date}_{end_date}.xlsx"
+        filepath = os.path.join(settings.MEDIA_ROOT, filename)
+        wb.save(filepath)
+        
+        file_url = request.build_absolute_uri(settings.MEDIA_URL + filename)
+        return Response({"file_url": file_url})
+    
+    def _build_punch_records(self, row_data):
+        """
+        Build a user-friendly string showing all check-in/checkout sessions with durations.
+        Format: "08:00 AM - 12:00 PM (4h 0m) | 01:00 PM - 06:00 PM (5h 0m)"
+        """
+        employee_name = row_data.get("name")
+        date_str = row_data.get("date")
+        
+        if not employee_name or not date_str:
+            return ""
+        
+        try:
+            # Parse date
+            check_date = datetime.strptime(date_str, '%Y-%m-%d').date()
+            
+            # Get employee
+            employee = Employee.objects.filter(name=employee_name).first()
+            if not employee:
+                return ""
+            
+            # Get all logs for this employee on this date
+            logs = AttendanceLog.objects.filter(
+                employee=employee,
+                timestamp__date=check_date
+            ).order_by('timestamp')
+            
+            if not logs.exists():
+                return ""
+            
+            # Build sessions
+            sessions = []
+            checkin_time = None
+            
+            for log in logs:
+                if log.type == 'checkin':
+                    checkin_time = log.timestamp
+                elif log.type == 'checkout' and checkin_time:
+                    # Calculate duration
+                    duration = log.timestamp - checkin_time
+                    hours = int(duration.total_seconds() // 3600)
+                    minutes = int((duration.total_seconds() % 3600) // 60)
+                    
+                    # Format session
+                    session_str = f"{checkin_time.strftime('%I:%M %p')} - {log.timestamp.strftime('%I:%M %p')} ({hours}h {minutes}m)"
+                    sessions.append(session_str)
+                    checkin_time = None
+            
+            # Handle unpaired check-in (no checkout)
+            if checkin_time:
+                sessions.append(f"{checkin_time.strftime('%I:%M %p')} - (No checkout)")
+            
+            # Join all sessions
+            return " | ".join(sessions) if sessions else ""
+            
+        except Exception as e:
+            logger.error(f"Error building punch records: {e}")
+            return ""
         
         # Save file
         filename = f"attendance_summary_{start_date.strftime('%Y%m%d')}_to_{end_date.strftime('%Y%m%d')}.xlsx"
