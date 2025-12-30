@@ -15,12 +15,14 @@ from .views import (
     PayslipBulkGenerateView,
     PayslipApproveView,
     PayslipDownloadView,
+    PayslipTemplatePreviewView,
 )
 
 urlpatterns = [
     # Payslip Template APIs
     path('payslip-templates/', PayslipTemplateListCreateView.as_view(), name='payslip-templates'),
     path('payslip-templates/<uuid:pk>/', PayslipTemplateDetailView.as_view(), name='payslip-template-detail'),
+    path('payslip-templates/<uuid:pk>/preview/', PayslipTemplatePreviewView.as_view(), name='payslip-template-preview'),
     
     # Payslip Field Config APIs
     path('payslip-field-configs/', PayslipFieldConfigListCreateView.as_view(), name='payslip-field-configs'),

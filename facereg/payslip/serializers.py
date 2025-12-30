@@ -5,7 +5,7 @@ from regface.models import Location, User, Employee
 
 class PayslipTemplateSerializer(serializers.ModelSerializer):
     location_id = serializers.PrimaryKeyRelatedField(
-        source='location', queryset=Location.objects.filter(is_deleted=False), write_only=True
+        source='location', queryset=Location.objects.filter(is_deleted=False)
     )
     location_name = serializers.CharField(source='location.name', read_only=True)
     created_by_name = serializers.CharField(source='created_by.name', read_only=True)
@@ -24,7 +24,7 @@ class PayslipTemplateSerializer(serializers.ModelSerializer):
 
 class PayslipFieldConfigSerializer(serializers.ModelSerializer):
     location_id = serializers.PrimaryKeyRelatedField(
-        source='location', queryset=Location.objects.filter(is_deleted=False), write_only=True
+        source='location', queryset=Location.objects.filter(is_deleted=False)
     )
     location_name = serializers.CharField(source='location.name', read_only=True)
     created_by_name = serializers.CharField(source='created_by.name', read_only=True)

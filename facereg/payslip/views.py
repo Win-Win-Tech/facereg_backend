@@ -10,6 +10,7 @@ from django.conf import settings
 from rest_framework import permissions, status
 from rest_framework.response import Response
 from rest_framework.views import APIView
+from rest_framework.parsers import MultiPartParser, FormParser
 
 from regface.models import User, Employee, Location
 from regface.views import AuthenticatedAPIView, is_superadmin
@@ -33,6 +34,8 @@ logger = logging.getLogger(__name__)
 # ==================== PayslipTemplate APIs ====================
 
 class PayslipTemplateListCreateView(AuthenticatedAPIView):
+    parser_classes = (MultiPartParser, FormParser)
+
     def get(self, request):
         location_id = request.query_params.get('location_id')
         templates = PayslipTemplate.objects.filter(is_deleted=False)
@@ -60,13 +63,23 @@ class PayslipTemplateListCreateView(AuthenticatedAPIView):
             # Admin can only create for their location
             request.data['location_id'] = str(request.user.location_id)
         
-        # Check if template already exists for location
+        # Check if template already exists for location (including deleted ones)
         location_id = request.data.get('location_id')
-        if PayslipTemplate.objects.filter(location_id=location_id, is_deleted=False).exists():
-            return Response(
-                {"detail": "Payslip template already exists for this location. Update existing template instead."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+        existing_template = PayslipTemplate.objects.filter(location_id=location_id).first()
+        
+        if existing_template:
+            if not existing_template.is_deleted:
+                return Response(
+                    {"detail": "Payslip template already exists for this location. Update existing template instead."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            else:
+                # Restore and update the deleted template
+                serializer = PayslipTemplateSerializer(existing_template, data=request.data)
+                if serializer.is_valid():
+                    serializer.save(created_by=request.user, is_deleted=False)
+                    return Response(serializer.data, status=status.HTTP_201_CREATED)
+                return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
         
         serializer = PayslipTemplateSerializer(data=request.data)
         if serializer.is_valid():
@@ -76,6 +89,8 @@ class PayslipTemplateListCreateView(AuthenticatedAPIView):
 
 
 class PayslipTemplateDetailView(AuthenticatedAPIView):
+    parser_classes = (MultiPartParser, FormParser)
+
     def get_object(self, pk):
         try:
             return PayslipTemplate.objects.get(pk=pk, is_deleted=False)
@@ -114,6 +129,97 @@ class PayslipTemplateDetailView(AuthenticatedAPIView):
         template.is_deleted = True
         template.save(update_fields=['is_deleted', 'updated_at'])
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class PayslipTemplatePreviewView(AuthenticatedAPIView):
+    def get(self, request, pk):
+        try:
+            template = PayslipTemplate.objects.get(pk=pk, is_deleted=False)
+        except PayslipTemplate.DoesNotExist:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+            
+        if request.user.role == User.Role.ADMIN and template.location_id != request.user.location_id:
+            return Response(status=status.HTTP_403_FORBIDDEN)
+            
+        # Prepare dummy data for preview
+        dummy_payslip_data = {
+            'employee_name': 'John Doe',
+            'employee_code': 'EMP001',
+            'employee_email': 'john.doe@example.com',
+            'designation': 'Software Engineer',
+            'department': 'Engineering',
+            'joining_date': datetime.now(),
+            'month': datetime.now().strftime('%Y-%m'),
+            'gross_salary': Decimal('50000.00'),
+            'total_earnings': Decimal('60000.00'),
+            'total_deductions': Decimal('5000.00'),
+            'net_pay': Decimal('55000.00'),
+            'net_pay': Decimal('55000.00'),
+            'field_values': {}, # Will be populated dynamically
+            'attendance': {
+                'present_days': Decimal('22'),
+                'absent_days': Decimal('0'),
+                'paid_leave_days': Decimal('0'),
+                'unpaid_leave_days': Decimal('0'),
+                'holiday_count': 0,
+                'weekoff_count': 8,
+                'working_days': 22,
+            },
+            'uan_no': '100000000000',
+            'pf_no': 'AB/CDE/0000000/000/0000000',
+            'esi_no': '0000000000',
+            'bank_name': 'HDFC Bank',
+            'account_no': '1234567890',
+            'pan_no': 'ABCDE1234F',
+            'cl_balance': Decimal('1.5'),
+        }
+        
+        template_data = {
+            'company_name': template.company_name,
+            'company_address': template.company_address,
+            'company_email': template.company_email,
+            'company_phone': template.company_phone,
+            'company_gstin': template.company_gstin,
+            'company_logo': template.company_logo,
+            'header_text': template.header_text,
+            'footer_text': template.footer_text,
+            'page_size': template.page_size,
+            'orientation': template.orientation,
+            'font_size': template.font_size,
+        }
+        
+        # Fetch field config for the location
+        field_config = PayslipFieldConfig.objects.filter(location=template.location, is_deleted=False).first()
+        
+        if field_config:
+            # Populate dummy values for configured fields so they appear in preview
+            dummy_values = {}
+            for field in field_config.fields.filter(is_deleted=False):
+                # Generate a dummy amount based on field type or name
+                if field.field_type == 'EARNING':
+                    if 'BASIC' in field.field_code: dummy_values[field.field_code] = 30000
+                    elif 'HRA' in field.field_code: dummy_values[field.field_code] = 12000
+                    else: dummy_values[field.field_code] = 5000
+                else: # DEDUCTION
+                    if 'PF' in field.field_code: dummy_values[field.field_code] = 3600
+                    elif 'ESI' in field.field_code: dummy_values[field.field_code] = 500
+                    else: dummy_values[field.field_code] = 1000
+            
+            dummy_payslip_data['field_values'] = dummy_values
+            
+            # Recalculate totals based on dummy values
+            total_earnings = sum(v for k, v in dummy_values.items() if k in [f.field_code for f in field_config.fields.filter(field_type='EARNING')])
+            total_deductions = sum(v for k, v in dummy_values.items() if k in [f.field_code for f in field_config.fields.filter(field_type='DEDUCTION')])
+            dummy_payslip_data['total_earnings'] = Decimal(total_earnings)
+            dummy_payslip_data['total_deductions'] = Decimal(total_deductions)
+            dummy_payslip_data['net_pay'] = Decimal(total_earnings - total_deductions)
+        
+        try:
+            pdf_buffer = generate_payslip_pdf(dummy_payslip_data, template_data, field_config=field_config)
+            filename = f"template_preview_{template.id}.pdf"
+            return FileResponse(pdf_buffer, as_attachment=False, filename=filename)
+        except Exception as e:
+            return Response({"detail": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
 # ==================== PayslipFieldConfig APIs ====================
@@ -523,6 +629,18 @@ class PayslipRecordDetailView(AuthenticatedAPIView):
             return Response(serializer.data)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
+    def delete(self, request, pk):
+        record = self.get_object(pk)
+        if not record:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+        
+        if request.user.role == User.Role.ADMIN:
+            if record.employee.location_id != request.user.location_id:
+                return Response(status=status.HTTP_403_FORBIDDEN)
+        
+        record.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
 
 class PayslipGenerateView(AuthenticatedAPIView):
     """Generate payslip for an employee"""
@@ -591,12 +709,10 @@ class PayslipGenerateView(AuthenticatedAPIView):
                     status=status.HTTP_404_NOT_FOUND,
                 )
         
-        # Check if payslip already exists
-        if PayslipRecord.objects.filter(employee=employee, month=month).exists():
-            return Response(
-                {"detail": f"Payslip for {month} already exists for this employee."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+        # Check if payslip already exists and delete it (overwrite)
+        existing_record = PayslipRecord.objects.filter(employee=employee, month=month).first()
+        if existing_record:
+            existing_record.delete()
         
         # Use calculation engine to calculate all field values
         from .calculation_engine import calculate_payslip_fields, CalculationError
@@ -706,14 +822,10 @@ class PayslipBulkGenerateView(AuthenticatedAPIView):
         errors = []
         
         for employee in employees:
-            # Check if payslip already exists
-            if PayslipRecord.objects.filter(employee=employee, month=month).exists():
-                errors.append({
-                    'employee_id': employee.id,
-                    'employee_name': employee.name,
-                    'error': f"Payslip for {month} already exists"
-                })
-                continue
+            # Check if payslip already exists and delete it (overwrite)
+            existing_record = PayslipRecord.objects.filter(employee=employee, month=month).first()
+            if existing_record:
+                existing_record.delete()
             
             # Get field config
             if shared_field_config:
