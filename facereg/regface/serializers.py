@@ -234,6 +234,9 @@ class EmployeeUpdateSerializer(serializers.ModelSerializer):
 
 
 class ShiftSerializer(serializers.ModelSerializer):
+    location_name = serializers.CharField(source='location.name', read_only=True)
+    location_id = serializers.UUIDField(required=False, allow_null=True, write_only=True)
+    
     class Meta:
         model = Shift
         fields = [
@@ -242,7 +245,9 @@ class ShiftSerializer(serializers.ModelSerializer):
             "start_time",
             "end_time",
             "grace_timing",
-            
+            "location",
+            "location_id",
+            "location_name",
             "created_on",
             "created_by",
             "modified_on",
@@ -257,7 +262,34 @@ class ShiftSerializer(serializers.ModelSerializer):
             "created_by",
             "modified_by",
             "deleted_by",
+            "location_name",
         ]
+    
+    def to_internal_value(self, data):
+        """Convert location_id from request body to location for model"""
+        if 'location_id' in data and 'location' not in data:
+            data = data.copy()
+            data['location'] = data.pop('location_id')
+        return super().to_internal_value(data)
+    
+    def to_representation(self, instance):
+        """Ensure location and location_id are always included in response"""
+        representation = super().to_representation(instance)
+        # Get location_id from the instance
+        try:
+            location_id = instance.location_id
+        except AttributeError:
+            # If location_id doesn't exist (migration not run), try to get from location
+            try:
+                location_id = instance.location.id if instance.location else None
+            except:
+                location_id = None
+        
+        # Always include location and location_id in response (as UUID string or None)
+        representation['location'] = str(location_id) if location_id else None
+        representation['location_id'] = str(location_id) if location_id else None
+        
+        return representation
 
 
 class SiteSerializer(serializers.ModelSerializer):

@@ -21,9 +21,38 @@ class EmployeeSerializer(serializers.ModelSerializer):
 
 
 class ShiftSerializer(serializers.ModelSerializer):
+    location_name = serializers.CharField(source='location.name', read_only=True)
+    location_id = serializers.UUIDField(required=False, allow_null=True, write_only=True)
+    
     class Meta:
         model = Shift
         fields = "__all__"
+    
+    def to_internal_value(self, data):
+        """Convert location_id from request body to location for model"""
+        if 'location_id' in data and 'location' not in data:
+            data = data.copy()
+            data['location'] = data.pop('location_id')
+        return super().to_internal_value(data)
+    
+    def to_representation(self, instance):
+        """Ensure location and location_id are always included in response"""
+        representation = super().to_representation(instance)
+        # Get location_id from the instance
+        try:
+            location_id = instance.location_id
+        except AttributeError:
+            # If location_id doesn't exist (migration not run), try to get from location
+            try:
+                location_id = instance.location.id if instance.location else None
+            except:
+                location_id = None
+        
+        # Always include location and location_id in response
+        representation['location'] = str(location_id) if location_id else None
+        representation['location_id'] = str(location_id) if location_id else None
+        
+        return representation
 
 
 class SiteSerializer(serializers.ModelSerializer):

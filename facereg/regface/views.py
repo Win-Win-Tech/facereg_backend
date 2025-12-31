@@ -380,7 +380,8 @@ class ShiftListCreateView(AuthenticatedAPIView):
             shifts = shifts.filter(sites__id=site_id)
 
         if location_id:
-            shifts = shifts.filter(sites__location_id=location_id)
+            # Filter by shift's location field directly
+            shifts = shifts.filter(location_id=location_id)
 
         shifts = shifts.order_by("shift_name").distinct()
 

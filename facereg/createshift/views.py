@@ -25,8 +25,23 @@ class EmployeeViewSet(viewsets.ModelViewSet):
 
 
 class ShiftViewSet(viewsets.ModelViewSet):
-    queryset = Shift.objects.all()
     serializer_class = ShiftSerializer
+    queryset = Shift.objects.filter(is_deleted=False)
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        location_id = self.request.query_params.get("location_id")
+
+        if location_id:
+            queryset = queryset.filter(location=location_id)
+
+        return queryset.select_related("location")
+
+    def perform_destroy(self, instance):
+        instance.is_deleted = True
+        instance.save()
+
+
 
 
 class SiteViewSet(viewsets.ModelViewSet):

@@ -12,6 +12,7 @@ class Shift(models.Model):
     start_time = models.TimeField()
     end_time = models.TimeField()
     grace_timing = models.IntegerField(default=30)  # minutes
+    location = models.ForeignKey("Location", on_delete=models.CASCADE, related_name="shifts", null=True, blank=True)
     created_on = models.DateTimeField(auto_now_add=True)
     created_by = models.ForeignKey(
         "User",
