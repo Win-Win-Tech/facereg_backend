@@ -48,9 +48,13 @@ class ShiftSerializer(serializers.ModelSerializer):
             except:
                 location_id = None
         
-        # Always include location and location_id in response
+        # Always include location and location_id in response (as UUID string or None)
         representation['location'] = str(location_id) if location_id else None
         representation['location_id'] = str(location_id) if location_id else None
+        
+        # Ensure location_name is included (from the default serializer behavior)
+        if 'location_name' not in representation:
+            representation['location_name'] = instance.location.name if instance.location else None
         
         return representation
 
