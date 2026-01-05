@@ -2396,6 +2396,8 @@ class AttendanceSummaryExportView(AuthenticatedAPIView):
         wb.save(filepath)
         
         file_url = request.build_absolute_uri(settings.MEDIA_URL + filename)
+        logger.info(f"File URL: {file_url}")
+        logger.info(f"File URL: {request.build_absolute_uri(settings.MEDIA_URL + filename)}")
         return Response({"file_url": file_url})
     
     def _build_punch_records(self, row_data, user=None):
