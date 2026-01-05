@@ -1976,9 +1976,19 @@ def calculate_attendance_summary(employees, start_date, end_date, user=None):
             earliest_checkin_log = checkin_logs[0] if checkin_logs else None
             latest_checkout_log = checkout_logs[-1] if checkout_logs else None
             
-            # For display purposes (return in response)
-            checkin_time = earliest_checkin_log.timestamp if earliest_checkin_log else None
-            checkout_time = latest_checkout_log.timestamp if latest_checkout_log else None
+            # For display purposes (return in response) - Convert UTC timestamps to user's timezone
+            checkin_time = None
+            checkout_time = None
+            if earliest_checkin_log:
+                checkin_ts_utc = earliest_checkin_log.timestamp
+                if timezone.is_naive(checkin_ts_utc):
+                    checkin_ts_utc = timezone.make_aware(checkin_ts_utc, pytz.UTC)
+                checkin_time = checkin_ts_utc.astimezone(user_tz)
+            if latest_checkout_log:
+                checkout_ts_utc = latest_checkout_log.timestamp
+                if timezone.is_naive(checkout_ts_utc):
+                    checkout_ts_utc = timezone.make_aware(checkout_ts_utc, pytz.UTC)
+                checkout_time = checkout_ts_utc.astimezone(user_tz)
             
             # Track multiple entries info
             checkin_count = len(checkin_logs)
@@ -1999,17 +2009,16 @@ def calculate_attendance_summary(employees, start_date, end_date, user=None):
                 
                 # Ensure checkout comes after checkin (valid pair)
                 if checkout_log.timestamp > checkin_log.timestamp:
-                    # Make timezone-aware
-                    tz = timezone.get_current_timezone()
+                    # Make timezone-aware (timestamps are stored in UTC)
                     checkin_ts = checkin_log.timestamp
                     checkout_ts = checkout_log.timestamp
                     
                     if timezone.is_naive(checkin_ts):
-                        checkin_ts = timezone.make_aware(checkin_ts, tz)
+                        checkin_ts = timezone.make_aware(checkin_ts, pytz.UTC)
                     if timezone.is_naive(checkout_ts):
-                        checkout_ts = timezone.make_aware(checkout_ts, tz)
+                        checkout_ts = timezone.make_aware(checkout_ts, pytz.UTC)
                     
-                    # Calculate duration for this pair
+                    # Calculate duration for this pair (both in UTC, so difference is correct)
                     pair_duration = (checkout_ts - checkin_ts).total_seconds()
                     
                     # Only add positive durations (safety check)
@@ -2017,13 +2026,22 @@ def calculate_attendance_summary(employees, start_date, end_date, user=None):
                         total_worked_seconds += pair_duration
                         paired_count += 1
                         
-                        # Store pair details for frontend
+                        # Store pair details for frontend - Convert UTC timestamps to user's timezone
                         hours = int(pair_duration // 3600)
                         minutes = int((pair_duration % 3600) // 60)
+                        # Convert timestamps to user's timezone for display
+                        checkin_ts_utc = checkin_log.timestamp
+                        checkout_ts_utc = checkout_log.timestamp
+                        if timezone.is_naive(checkin_ts_utc):
+                            checkin_ts_utc = timezone.make_aware(checkin_ts_utc, pytz.UTC)
+                        if timezone.is_naive(checkout_ts_utc):
+                            checkout_ts_utc = timezone.make_aware(checkout_ts_utc, pytz.UTC)
+                        checkin_ts_local = checkin_ts_utc.astimezone(user_tz)
+                        checkout_ts_local = checkout_ts_utc.astimezone(user_tz)
                         pair_details.append({
                             "pair_number": paired_count,
-                            "checkin": checkin_log.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
-                            "checkout": checkout_log.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+                            "checkin": checkin_ts_local.strftime("%Y-%m-%d %H:%M:%S"),
+                            "checkout": checkout_ts_local.strftime("%Y-%m-%d %H:%M:%S"),
                             "duration": f"{hours:02d}:{minutes:02d}",
                             "duration_seconds": int(pair_duration)
                         })
@@ -2080,12 +2098,8 @@ def calculate_attendance_summary(employees, start_date, end_date, user=None):
             if effective_shift is None:
                 effective_shift = shift
             
-            # Make times timezone-aware for consistent calculations
-            tz = timezone.get_current_timezone()
-            if checkin_time and timezone.is_naive(checkin_time):
-                checkin_time = timezone.make_aware(checkin_time, tz)
-            if checkout_time and timezone.is_naive(checkout_time):
-                checkout_time = timezone.make_aware(checkout_time, tz)
+            # Times are already converted to user's timezone above, no need to convert again
+            # (They're already timezone-aware in user_tz)
             
             # If no checkin on this day, mark as Absent
             if not checkin_time:
@@ -2174,21 +2188,18 @@ def calculate_attendance_summary(employees, start_date, end_date, user=None):
                     })
                     continue
                 
-                # Create aware datetime objects for today
-                shift_start_dt = timezone.make_aware(
-                    datetime.combine(log_date, shift_start_time),
-                    tz
+                # Create aware datetime objects for today in user's timezone
+                shift_start_dt = user_tz.localize(
+                    datetime.combine(log_date, shift_start_time)
                 )
-                shift_end_dt = timezone.make_aware(
-                    datetime.combine(log_date, shift_end_time),
-                    tz
+                shift_end_dt = user_tz.localize(
+                    datetime.combine(log_date, shift_end_time)
                 )
                 
                 # Handle night shifts (end_time < start_time)
                 if shift_end_time < shift_start_time:
-                    shift_end_dt = timezone.make_aware(
-                        datetime.combine(log_date + timedelta(days=1), shift_end_time),
-                        tz
+                    shift_end_dt = user_tz.localize(
+                        datetime.combine(log_date + timedelta(days=1), shift_end_time)
                     )
                 
                 shift_duration_seconds = (shift_end_dt - shift_start_dt).total_seconds()
