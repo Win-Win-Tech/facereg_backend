@@ -1451,7 +1451,34 @@ class FaceAttendanceView(APIView):
         else:
             entry_type = "checkout" if last_log.type == "checkin" else "checkin"
         logger.info(f"DEBUG: entry_type={entry_type}")
+        logger.info(f"DEBUG: has_checkin={has_checkin}, has_checkout={has_checkout}, last_log_type={last_log.type if last_log else None}")
+        
+        # --- 5-Minute Cooldown Check (Check BEFORE "already marked") ---
+        # Check if this employee has marked attendance in the last 5 minutes
+        five_minutes_ago = now - timedelta(minutes=5)
+        recent_log = AttendanceLog.objects.filter(
+            employee=matched_employee,
+            timestamp__gte=five_minutes_ago
+        ).order_by('-timestamp').first()
+
+        if recent_log:
+            time_since_last = now - recent_log.timestamp
+            cooldown_duration = timedelta(minutes=5)
+            seconds_remaining = int((cooldown_duration - time_since_last).total_seconds())
+            
+            if seconds_remaining > 0:
+                action_readable = "check-out" if recent_log.type == "checkout" else "check-in"
+                return Response({
+                    "error": "Too soon to mark attendance",
+                    "message": f"Please wait, your {action_readable} has already been recorded.",
+                    "seconds_remaining": max(1, seconds_remaining),
+                    "last_attendance": recent_log.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+                    "last_type": recent_log.type,
+                }, status=status.HTTP_429_TOO_MANY_REQUESTS)
+        
         # --- Shift timing check ---
+        # Note: "already marked" check removed - cooldown check handles the per-employee 5-min limit
+        # If they've completed checkin+checkout, they can check in again after 5 mins
         status_label = "Checked-in"
         minutes_late = None
         minutes_early = None
