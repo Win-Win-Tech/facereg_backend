@@ -64,6 +64,7 @@ class User(models.Model):
     role = models.CharField(max_length=20, choices=Role.choices)
     location = models.ForeignKey("Location", on_delete=models.SET_NULL, null=True, blank=True, related_name="users")
     password = models.CharField(max_length=128)
+    timezone = models.CharField(max_length=50, default='Asia/Kolkata', help_text="User's timezone (e.g., Asia/Kolkata, Asia/Kuala_Lumpur)")
     is_active = models.BooleanField(default=True)
     is_deleted = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)

@@ -17,6 +17,7 @@ from rest_framework import permissions, status
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from django.utils import timezone
+import pytz
 from .face_utils import get_face_encoding
 from .face_index import FaceIndexManager
 from .models import AttendanceLog, AuthToken, Employee, Location, PayrollRecord, User, UserSite, Site, Shift, Assignment
@@ -44,6 +45,28 @@ logger.info(f"timezone.now()={timezone.localtime()}")
 
 def is_superadmin(user: User) -> bool:
     return getattr(user, "role", None) == User.Role.SUPERADMIN
+
+
+def get_user_timezone(user):
+    """Get user's timezone or default to Asia/Kolkata"""
+    if user and hasattr(user, 'timezone') and user.timezone:
+        try:
+            return pytz.timezone(user.timezone)
+        except pytz.exceptions.UnknownTimeZoneError:
+            logger.warning(f"Unknown timezone '{user.timezone}' for user {user.email}, using default")
+    return pytz.timezone('Asia/Kolkata')
+
+
+def get_user_local_date(user, utc_datetime=None):
+    """Get today's date in user's timezone"""
+    if utc_datetime is None:
+        utc_datetime = timezone.now()
+    user_tz = get_user_timezone(user)
+    # Convert UTC datetime to user's timezone
+    if timezone.is_naive(utc_datetime):
+        utc_datetime = timezone.make_aware(utc_datetime, pytz.UTC)
+    local_datetime = utc_datetime.astimezone(user_tz)
+    return local_datetime.date()
 
 
 class AuthenticatedAPIView(APIView):
@@ -1215,9 +1238,12 @@ class FaceAttendanceView(APIView):
             if matched_employee.location != user.location:
                  return Response({"error": "Face not recognized (Location mismatch)"}, status=status.HTTP_404_NOT_FOUND)
 
-        today = date.today()
-        now = timezone.now()
-        logger.info(f"DEBUG: today={today}, now={now}")
+        # Get user's timezone and calculate today's date in user's timezone
+        now = timezone.now()  # UTC
+        today = get_user_local_date(user, now)
+        user_tz = get_user_timezone(user)
+        now_local = now.astimezone(user_tz) if not timezone.is_naive(now) else timezone.make_aware(now, pytz.UTC).astimezone(user_tz)
+        logger.info(f"DEBUG: user={user.email if user else None}, user_timezone={user.timezone if user and hasattr(user, 'timezone') else 'Asia/Kolkata'}, today={today}, now_utc={now}, now_local={now_local}")
         # --- Attendance rules ---
         # Filter assignments by valid date range for today
         from django.db.models import Q
@@ -1309,8 +1335,21 @@ class FaceAttendanceView(APIView):
             nearest_distance = None
 
         # --- Auto checkin/checkout ---
-        logs_today = AttendanceLog.objects.filter(employee=matched_employee, timestamp__date=today)
-        logger.info(f"DEBUG: logs_today={logs_today.count()}")
+        # Filter logs by date in user's timezone
+        # Since timestamps are stored in UTC, we need to filter by date range that covers the user's local day
+        user_tz = get_user_timezone(user)
+        # Get start and end of day in user's timezone, then convert to UTC for filtering
+        start_of_day_local = user_tz.localize(datetime.combine(today, datetime.min.time()))
+        end_of_day_local = user_tz.localize(datetime.combine(today, datetime.max.time().replace(microsecond=999999)))
+        start_of_day_utc = start_of_day_local.astimezone(pytz.UTC)
+        end_of_day_utc = end_of_day_local.astimezone(pytz.UTC)
+        
+        logs_today = AttendanceLog.objects.filter(
+            employee=matched_employee,
+            timestamp__gte=start_of_day_utc,
+            timestamp__lte=end_of_day_utc
+        )
+        logger.info(f"DEBUG: Filtering logs - today_local={today}, start_utc={start_of_day_utc}, end_utc={end_of_day_utc}, logs_today={logs_today.count()}")
         if shift:
             has_checkin = logs_today.filter(type="checkin", shift=shift).exists()
             has_checkout = logs_today.filter(type="checkout", shift=shift).exists()
@@ -1763,16 +1802,32 @@ class RegisterEmployeeView(AuthenticatedAPIView):
         )
 
 
-def calculate_attendance_summary(employees, start_date, end_date):
+def calculate_attendance_summary(employees, start_date, end_date, user=None):
     """
     Shared helper function to calculate attendance summary for all employees.
     Handles multiple check-ins/check-outs by pairing sequentially and summing durations.
     
+    Args:
+        employees: QuerySet of employees
+        start_date: Start date in user's timezone
+        end_date: End date in user's timezone
+        user: User object to determine timezone (defaults to Asia/Kolkata)
+    
     Returns: List of dictionaries with attendance summary data
     """
     summary = []
+    user_tz = get_user_timezone(user)
+    
+    # Convert date range to UTC datetime range for filtering
+    # Start of first day in user's timezone
+    start_datetime_local = user_tz.localize(datetime.combine(start_date, datetime.min.time()))
+    # End of last day in user's timezone
+    end_datetime_local = user_tz.localize(datetime.combine(end_date, datetime.max.time().replace(microsecond=999999)))
+    # Convert to UTC
+    start_datetime_utc = start_datetime_local.astimezone(pytz.UTC)
+    end_datetime_utc = end_datetime_local.astimezone(pytz.UTC)
 
-    # Generate all dates in range
+    # Generate all dates in range (in user's timezone)
     all_dates = []
     current_date = start_date
     while current_date <= end_date:
@@ -1782,15 +1837,22 @@ def calculate_attendance_summary(employees, start_date, end_date):
     from django.db.models import Q
     
     for emp in employees:
+        # Filter logs by UTC datetime range
         logs = emp.attendancelog_set.filter(
-            timestamp__date__range=(start_date, end_date)
+            timestamp__gte=start_datetime_utc,
+            timestamp__lte=end_datetime_utc
         ).select_related('shift', 'site')
         
-        # Group logs by date
+        # Group logs by date in user's timezone
         logs_by_date = defaultdict(list)
         for log in logs:
-            log_date = log.timestamp.date()
-            logs_by_date[log_date].append(log)
+            # Convert UTC timestamp to user's timezone and get date
+            if timezone.is_naive(log.timestamp):
+                log_timestamp = timezone.make_aware(log.timestamp, pytz.UTC)
+            else:
+                log_timestamp = log.timestamp
+            log_date_local = log_timestamp.astimezone(user_tz).date()
+            logs_by_date[log_date_local].append(log)
         
         # Process each date in range (including dates with no logs)
         for log_date in all_dates:
@@ -2145,8 +2207,9 @@ def calculate_attendance_summary(employees, start_date, end_date):
 
 class AttendanceSummaryView(AuthenticatedAPIView):
     def get(self, request):
-        today = timezone.localtime().date()
-        logger.info(f"Attendance summary requested. Current timezone date: {today}, timezone.now(): {timezone.localtime()}")  # Use timezone-aware date
+        # Get today's date in user's timezone
+        today = get_user_local_date(request.user, timezone.now())
+        logger.info(f"Attendance summary requested. User={request.user.email if request.user else None}, timezone={request.user.timezone if request.user and hasattr(request.user, 'timezone') else 'Asia/Kolkata'}, today={today}")
         start_date = request.query_params.get('start_date', today.strftime('%Y-%m-%d'))
         end_date = request.query_params.get('end_date', today.strftime('%Y-%m-%d'))
         
@@ -2162,16 +2225,17 @@ class AttendanceSummaryView(AuthenticatedAPIView):
         if request.user.role == User.Role.ADMIN:
             employees = employees.filter(location=request.user.location)
 
-        # Use shared helper function
-        summary = calculate_attendance_summary(employees, start_date, end_date)
+        # Use shared helper function with user timezone
+        summary = calculate_attendance_summary(employees, start_date, end_date, user=request.user)
         
         return Response(summary)
 
 
 class AttendanceSummaryExportView(AuthenticatedAPIView):
     def get(self, request):
-        today = timezone.localtime().date()  # Use timezone-aware date
-        logger.info(f"Attendance export requested. Current timezone date: {today}, timezone.now(): {timezone.localtime()}")
+        # Get today's date in user's timezone
+        today = get_user_local_date(request.user, timezone.now())
+        logger.info(f"Attendance export requested. User={request.user.email if request.user else None}, timezone={request.user.timezone if request.user and hasattr(request.user, 'timezone') else 'Asia/Kolkata'}, today={today}")
         start_date = request.query_params.get('start_date', today.strftime('%Y-%m-%d'))
         end_date = request.query_params.get('end_date', today.strftime('%Y-%m-%d'))
         
@@ -2187,8 +2251,8 @@ class AttendanceSummaryExportView(AuthenticatedAPIView):
         if request.user.role == User.Role.ADMIN:
             employees = employees.filter(location=request.user.location)
         
-        # Use shared helper function
-        summary = calculate_attendance_summary(employees, start_date, end_date)
+        # Use shared helper function with user timezone
+        summary = calculate_attendance_summary(employees, start_date, end_date, user=request.user)
         
         # Convert to Excel
         wb = Workbook()
@@ -2206,7 +2270,7 @@ class AttendanceSummaryExportView(AuthenticatedAPIView):
         # Add data rows
         for row_data in summary:
             # Build PunchRecords column - all check-in/checkout sessions with durations
-            punch_records = self._build_punch_records(row_data)
+            punch_records = self._build_punch_records(row_data, user=request.user)
             
             ws.append([
                 row_data["date"],
@@ -2239,7 +2303,7 @@ class AttendanceSummaryExportView(AuthenticatedAPIView):
         file_url = request.build_absolute_uri(settings.MEDIA_URL + filename)
         return Response({"file_url": file_url})
     
-    def _build_punch_records(self, row_data):
+    def _build_punch_records(self, row_data, user=None):
         """
         Build a user-friendly string showing all check-in/checkout sessions with durations.
         Format: "08:00 AM - 12:00 PM (4h 0m) | 01:00 PM - 06:00 PM (5h 0m)"
@@ -2251,7 +2315,7 @@ class AttendanceSummaryExportView(AuthenticatedAPIView):
             return ""
         
         try:
-            # Parse date
+            # Parse date (this is already in user's timezone from calculate_attendance_summary)
             check_date = datetime.strptime(date_str, '%Y-%m-%d').date()
             
             # Get employee
@@ -2259,30 +2323,45 @@ class AttendanceSummaryExportView(AuthenticatedAPIView):
             if not employee:
                 return ""
             
-            # Get all logs for this employee on this date
+            # Convert date range to UTC for filtering
+            user_tz = get_user_timezone(user)
+            start_datetime_local = user_tz.localize(datetime.combine(check_date, datetime.min.time()))
+            end_datetime_local = user_tz.localize(datetime.combine(check_date, datetime.max.time().replace(microsecond=999999)))
+            start_datetime_utc = start_datetime_local.astimezone(pytz.UTC)
+            end_datetime_utc = end_datetime_local.astimezone(pytz.UTC)
+            
+            # Get all logs for this employee on this date (in user's timezone)
             logs = AttendanceLog.objects.filter(
                 employee=employee,
-                timestamp__date=check_date
+                timestamp__gte=start_datetime_utc,
+                timestamp__lte=end_datetime_utc
             ).order_by('timestamp')
             
             if not logs.exists():
                 return ""
             
-            # Build sessions
+            # Build sessions (convert timestamps to user's timezone for display)
             sessions = []
             checkin_time = None
             
             for log in logs:
+                # Convert UTC timestamp to user's timezone
+                if timezone.is_naive(log.timestamp):
+                    log_timestamp = timezone.make_aware(log.timestamp, pytz.UTC)
+                else:
+                    log_timestamp = log.timestamp
+                log_timestamp_local = log_timestamp.astimezone(user_tz)
+                
                 if log.type == 'checkin':
-                    checkin_time = log.timestamp
+                    checkin_time = log_timestamp_local
                 elif log.type == 'checkout' and checkin_time:
                     # Calculate duration
-                    duration = log.timestamp - checkin_time
+                    duration = log_timestamp_local - checkin_time
                     hours = int(duration.total_seconds() // 3600)
                     minutes = int((duration.total_seconds() % 3600) // 60)
                     
                     # Format session
-                    session_str = f"{checkin_time.strftime('%I:%M %p')} - {log.timestamp.strftime('%I:%M %p')} ({hours}h {minutes}m)"
+                    session_str = f"{checkin_time.strftime('%I:%M %p')} - {log_timestamp_local.strftime('%I:%M %p')} ({hours}h {minutes}m)"
                     sessions.append(session_str)
                     checkin_time = None
             
@@ -2325,6 +2404,13 @@ class MonthlyAttendanceStatusView(AuthenticatedAPIView):
                 {"error": "Invalid month format"}, status=status.HTTP_400_BAD_REQUEST
             )
 
+        # Convert date range to UTC for filtering
+        user_tz = get_user_timezone(request.user)
+        start_datetime_local = user_tz.localize(datetime.combine(start_date, datetime.min.time()))
+        end_datetime_local = user_tz.localize(datetime.combine(end_date, datetime.max.time().replace(microsecond=999999)))
+        start_datetime_utc = start_datetime_local.astimezone(pytz.UTC)
+        end_datetime_utc = end_datetime_local.astimezone(pytz.UTC)
+
         date_range = [
             start_date + timedelta(days=i)
             for i in range((end_date - start_date).days + 1)
@@ -2334,7 +2420,8 @@ class MonthlyAttendanceStatusView(AuthenticatedAPIView):
             employees = employees.filter(location=request.user.location)
 
         logs = AttendanceLog.objects.filter(
-            timestamp__date__range=(start_date, end_date)
+            timestamp__gte=start_datetime_utc,
+            timestamp__lte=end_datetime_utc
         )
         if request.user.role == User.Role.ADMIN:
             logs = logs.filter(employee__location=request.user.location)
@@ -2342,7 +2429,12 @@ class MonthlyAttendanceStatusView(AuthenticatedAPIView):
         logs_by_key = defaultdict(list)
         for log in logs:
             try:
-                log_date = log.timestamp.date()
+                # Convert UTC timestamp to user's timezone and get date
+                if timezone.is_naive(log.timestamp):
+                    log_timestamp = timezone.make_aware(log.timestamp, pytz.UTC)
+                else:
+                    log_timestamp = log.timestamp
+                log_date = log_timestamp.astimezone(user_tz).date()
             except Exception:
                 continue
             logs_by_key[(log.employee_id, log_date)].append(log)
@@ -2410,6 +2502,13 @@ class MonthlyAttendanceStatusExportView(AuthenticatedAPIView):
         except Exception:
             return Response({"error": "Invalid month format"}, status=400)
 
+        # Convert date range to UTC for filtering
+        user_tz = get_user_timezone(request.user)
+        start_datetime_local = user_tz.localize(datetime.combine(start_date, datetime.min.time()))
+        end_datetime_local = user_tz.localize(datetime.combine(end_date, datetime.max.time().replace(microsecond=999999)))
+        start_datetime_utc = start_datetime_local.astimezone(pytz.UTC)
+        end_datetime_utc = end_datetime_local.astimezone(pytz.UTC)
+
         date_range = [
             start_date + timedelta(days=i)
             for i in range((end_date - start_date).days + 1)
@@ -2419,14 +2518,21 @@ class MonthlyAttendanceStatusExportView(AuthenticatedAPIView):
             employees = employees.filter(location=request.user.location)
 
         logs = AttendanceLog.objects.filter(
-            timestamp__date__range=(start_date, end_date)
+            timestamp__gte=start_datetime_utc,
+            timestamp__lte=end_datetime_utc
         )
         if request.user.role == User.Role.ADMIN:
             logs = logs.filter(employee__location=request.user.location)
 
         attendance_map = {}
         for log in logs:
-            key = (log.employee_id, log.timestamp.date())
+            # Convert UTC timestamp to user's timezone and get date
+            if timezone.is_naive(log.timestamp):
+                log_timestamp = timezone.make_aware(log.timestamp, pytz.UTC)
+            else:
+                log_timestamp = log.timestamp
+            log_date = log_timestamp.astimezone(user_tz).date()
+            key = (log.employee_id, log_date)
             attendance_map[key] = "P"
 
         wb = Workbook()
@@ -2478,17 +2584,33 @@ class GeneratePayrollView(AuthenticatedAPIView):
         start_date = datetime(year, month_num, 1).date()
         end_date = datetime(year, month_num, monthrange(year, month_num)[1]).date()
 
+        # Convert date range to UTC for filtering
+        user_tz = get_user_timezone(request.user)
+        start_datetime_local = user_tz.localize(datetime.combine(start_date, datetime.min.time()))
+        end_datetime_local = user_tz.localize(datetime.combine(end_date, datetime.max.time().replace(microsecond=999999)))
+        start_datetime_utc = start_datetime_local.astimezone(pytz.UTC)
+        end_datetime_utc = end_datetime_local.astimezone(pytz.UTC)
+
         employees = Employee.objects.all()
         if request.user.role == User.Role.ADMIN:
             employees = employees.filter(location=request.user.location)
 
-        logs = AttendanceLog.objects.filter(timestamp__date__range=(start_date, end_date))
+        logs = AttendanceLog.objects.filter(
+            timestamp__gte=start_datetime_utc,
+            timestamp__lte=end_datetime_utc
+        )
         if request.user.role == User.Role.ADMIN:
             logs = logs.filter(employee__location=request.user.location)
 
         attendance_map = {}
         for log in logs:
-            key = (log.employee_id, log.timestamp.date())
+            # Convert UTC timestamp to user's timezone and get date
+            if timezone.is_naive(log.timestamp):
+                log_timestamp = timezone.make_aware(log.timestamp, pytz.UTC)
+            else:
+                log_timestamp = log.timestamp
+            log_date = log_timestamp.astimezone(user_tz).date()
+            key = (log.employee_id, log_date)
             attendance_map[key] = "P"
 
         for emp in employees:

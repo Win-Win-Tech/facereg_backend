@@ -76,6 +76,7 @@ class UserSerializer(serializers.ModelSerializer):
             "email",
             "role",
             "location_id",
+            "timezone",
             "is_active",
             "is_deleted",
             "created_at",
