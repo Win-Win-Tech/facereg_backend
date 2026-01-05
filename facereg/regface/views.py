@@ -47,22 +47,78 @@ def is_superadmin(user: User) -> bool:
     return getattr(user, "role", None) == User.Role.SUPERADMIN
 
 
-def get_user_timezone(user):
-    """Get user's timezone or default to Asia/Kolkata"""
-    if user and hasattr(user, 'timezone') and user.timezone:
-        try:
-            return pytz.timezone(user.timezone)
-        except pytz.exceptions.UnknownTimeZoneError:
-            logger.warning(f"Unknown timezone '{user.timezone}' for user {user.email}, using default")
+def get_timezone_from_location(location):
+    """Get timezone from location by finding an admin user for that location
+    
+    Args:
+        location: Location instance or None
+    
+    Returns:
+        pytz timezone object
+    """
+    if location:
+        # Find an admin user for this location
+        admin_user = User.objects.filter(
+            location=location,
+            role=User.Role.ADMIN,
+            is_deleted=False,
+            is_active=True
+        ).first()
+        
+        if admin_user:
+            admin_timezone = getattr(admin_user, 'timezone', None)
+            if admin_timezone:
+                try:
+                    return pytz.timezone(admin_timezone)
+                except pytz.exceptions.UnknownTimeZoneError:
+                    logger.warning(f"Unknown timezone '{admin_timezone}' for admin {admin_user.email} at location {location.name}, using default")
+    # Default to Asia/Kolkata if no location or no admin found
     return pytz.timezone('Asia/Kolkata')
 
 
-def get_user_local_date(user, utc_datetime=None):
-    """Get today's date in user's timezone"""
+def get_user_timezone(user, location=None):
+    """Get user's timezone, or location's admin timezone, or default to Asia/Kolkata
+    
+    Args:
+        user: User instance or AnonymousUser or None
+        location: Location instance (used when user is AnonymousUser to find admin timezone)
+    
+    Returns:
+        pytz timezone object
+    """
+    # Check if user is authenticated and is a User instance (not AnonymousUser)
+    if user and isinstance(user, User):
+        user_timezone = getattr(user, 'timezone', None)
+        if user_timezone:
+            try:
+                return pytz.timezone(user_timezone)
+            except pytz.exceptions.UnknownTimeZoneError:
+                user_email = getattr(user, 'email', 'unknown')
+                logger.warning(f"Unknown timezone '{user_timezone}' for user {user_email}, using default")
+    
+    # For AnonymousUser or None, try to get timezone from location's admin
+    if location:
+        return get_timezone_from_location(location)
+    
+    # Default to Asia/Kolkata
+    return pytz.timezone('Asia/Kolkata')
+
+
+def get_user_local_date(user, utc_datetime=None, location=None):
+    """Get today's date in user's timezone or location's admin timezone
+    
+    Args:
+        user: User instance or AnonymousUser or None
+        utc_datetime: UTC datetime (defaults to now)
+        location: Location instance (used when user is AnonymousUser)
+    
+    Returns:
+        date object in user's/location's timezone
+    """
     if utc_datetime is None:
         utc_datetime = timezone.now()
-    user_tz = get_user_timezone(user)
-    # Convert UTC datetime to user's timezone
+    user_tz = get_user_timezone(user, location=location)
+    # Convert UTC datetime to user's/location's timezone
     if timezone.is_naive(utc_datetime):
         utc_datetime = timezone.make_aware(utc_datetime, pytz.UTC)
     local_datetime = utc_datetime.astimezone(user_tz)
@@ -1238,12 +1294,40 @@ class FaceAttendanceView(APIView):
             if matched_employee.location != user.location:
                  return Response({"error": "Face not recognized (Location mismatch)"}, status=status.HTTP_404_NOT_FOUND)
 
-        # Get user's timezone and calculate today's date in user's timezone
+        # Get timezone and calculate today's date
+        # For unauthenticated requests (Face_AI_Frontend), use employee's location admin timezone
+        # For authenticated users, use their timezone
         now = timezone.now()  # UTC
-        today = get_user_local_date(user, now)
-        user_tz = get_user_timezone(user)
+        employee_location = matched_employee.location if matched_employee else None
+        user_tz = get_user_timezone(user, location=employee_location)  # Uses location admin timezone if AnonymousUser
+        today = get_user_local_date(user, now, location=employee_location)  # Uses location admin timezone if AnonymousUser
         now_local = now.astimezone(user_tz) if not timezone.is_naive(now) else timezone.make_aware(now, pytz.UTC).astimezone(user_tz)
-        logger.info(f"DEBUG: user={user.email if user else None}, user_timezone={user.timezone if user and hasattr(user, 'timezone') else 'Asia/Kolkata'}, today={today}, now_utc={now}, now_local={now_local}")
+        
+        # Safe logging - handle AnonymousUser
+        user_email = None
+        user_timezone_str = 'Asia/Kolkata'
+        if user and isinstance(user, User):
+            user_email = getattr(user, 'email', None)
+            user_timezone_str = getattr(user, 'timezone', 'Asia/Kolkata')
+        elif user and hasattr(user, 'is_authenticated') and not user.is_authenticated:
+            user_email = 'AnonymousUser'
+            # Get timezone from location's admin
+            if employee_location:
+                admin_user = User.objects.filter(
+                    location=employee_location,
+                    role=User.Role.ADMIN,
+                    is_deleted=False,
+                    is_active=True
+                ).first()
+                if admin_user:
+                    user_timezone_str = getattr(admin_user, 'timezone', 'Asia/Kolkata')
+                    logger.info(f"DEBUG: Using admin timezone for location {employee_location.name}: {user_timezone_str} (from admin {admin_user.email})")
+                else:
+                    user_timezone_str = f"Location:{employee_location.name} (no admin, default)"
+            else:
+                user_timezone_str = 'No location (default)'
+        
+        logger.info(f"DEBUG: user={user_email}, employee_location={employee_location.name if employee_location else None}, timezone={user_timezone_str}, today={today}, now_utc={now}, now_local={now_local}")
         # --- Attendance rules ---
         # Filter assignments by valid date range for today
         from django.db.models import Q
