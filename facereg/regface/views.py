@@ -130,6 +130,18 @@ class AuthenticatedAPIView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
 
+class TimezoneListView(APIView):
+    """API endpoint to get all available timezones"""
+    
+    def get(self, request):
+        """Return list of all available timezones from pytz"""
+        timezones = [
+            {"value": tz, "label": tz}
+            for tz in pytz.all_timezones
+        ]
+        return Response(timezones)
+
+
 class LocationListCreateView(AuthenticatedAPIView):
     def get(self, request):
         include_deleted = request.query_params.get("include_deleted") == "true"

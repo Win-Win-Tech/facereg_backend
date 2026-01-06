@@ -23,6 +23,7 @@ from .views import (
     SiteListCreateView,
     SiteDetailView,
     SiteBulkShiftAssignView,
+    TimezoneListView,
     UserDetailView,
     UserListCreateView,
     UserSiteDetailView,
@@ -32,6 +33,7 @@ from .views import (
 urlpatterns = [
     path("auth/login/", LoginView.as_view(), name="login"),
     path("auth/logout/", LogoutView.as_view(), name="logout"),
+    path("timezones/", TimezoneListView.as_view(), name="timezones"),
     path("locations/", LocationListCreateView.as_view(), name="locations"),
     path("locations/<uuid:pk>/", LocationDetailView.as_view(), name="location-detail"),
     path("users/", UserListCreateView.as_view(), name="users"),
