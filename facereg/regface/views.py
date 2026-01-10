@@ -1341,38 +1341,19 @@ class FaceAttendanceView(APIView):
         
         logger.info(f"DEBUG: user={user_email}, employee_location={employee_location.name if employee_location else None}, timezone={user_timezone_str}, today={today}, now_utc={now}, now_local={now_local}")
         # --- Attendance rules ---
-        # Filter assignments by valid date range for today
         from django.db.models import Q
-        assignment = Assignment.objects.filter(
-            user_id=matched_employee.id,
-            location_id=matched_employee.location_id,
-            is_deleted=False
-        ).filter(
-            # From date is NULL OR from_date <= today
-            Q(assignment_from_date__isnull=True) | Q(assignment_from_date__lte=today)
-        ).filter(
-            # To date is NULL OR to_date >= today
-            Q(assignment_to_date__isnull=True) | Q(assignment_to_date__gte=today)
-        ).select_related("shift").order_by("-created_on").first()
 
-        user_sites = UserSite.objects.filter(user_id=matched_employee.id).select_related("site")
-        location_sites = Site.objects.filter(location_id=matched_employee.location_id)
-        logger.info(f"DEBUG: assignment={assignment}")
+        user_sites = UserSite.objects.filter(user_id=matched_employee.id, is_deleted=False).select_related("site")
+        location_sites = Site.objects.filter(location_id=matched_employee.location_id, is_deleted=False)
+        
+        # Log the sites assigned to this employee
+        assigned_site_ids = [us.site.id for us in user_sites]
+        logger.info(f"DEBUG: Employee {matched_employee.id} has {len(assigned_site_ids)} assigned sites: {assigned_site_ids}")
+        
         shift = None
-        if assignment and getattr(assignment, 'shift', None):
-            candidate_shift = assignment.shift
-            # Check if shift is deleted
-            is_deleted = getattr(candidate_shift, 'is_deleted', False)
-            if is_deleted:
-                # Shift is deleted, don't use it
-                shift = None
-            else:
-                start_time = getattr(candidate_shift, 'start_time', None)
-                end_time = getattr(candidate_shift, 'end_time', None)          
-                if start_time not in (None, '') and end_time not in (None, ''):
-                    shift = candidate_shift
-        logger.info(f"DEBUG: shift={shift}")
+        # Use only explicitly assigned sites, or all location sites if none are assigned
         sites = [us.site for us in user_sites] if user_sites.exists() else list(location_sites)
+        logger.info(f"DEBUG: Will use {len(sites)} sites for geofence check (from {'UserSite assignments' if user_sites.exists() else 'location_sites'})")
 
         # --- Geofence check ---
         def _safe_float(value):
@@ -1416,15 +1397,40 @@ class FaceAttendanceView(APIView):
                     },
                     status=status.HTTP_403_FORBIDDEN,
                 )
-            # If the nearest site has exactly one assigned shift, prefer it over assignment shift
+            # ✅ PRIORITY: Use employee's ASSIGNED shift from Assignment table
+            # The shift must also be available in the site's M2M (regface_site_shifts) assignments
+            logger.info(f"DEBUG: Finding shifts for nearest_site: {nearest_site.id}")
             try:
-                assigned = list(nearest_site.shifts.filter(is_deleted=False))
-                if len(assigned) == 1:
-                    site_shift = assigned[0]
-                    if getattr(site_shift, 'start_time', None) not in (None, '') and getattr(site_shift, 'end_time', None) not in (None, ''):
-                        shift = site_shift
-            except Exception:
-                pass
+                # Step 1: Get employee's shift assignment (location-based assignment)
+                # This is the SPECIFIC shift they should use
+                assignment = Assignment.objects.filter(
+                    user_id=matched_employee.id,
+                    location_id=matched_employee.location_id,
+                    is_deleted=False
+                ).order_by('-assignment_from_date').first()
+                
+                if assignment and assignment.shift:
+                    assigned_shift = assignment.shift
+                    logger.info(f"DEBUG: Employee has shift assignment: {assigned_shift.shift_name} ({assigned_shift.start_time} - {assigned_shift.end_time}) [id={assigned_shift.id}]")
+                    
+                    # Step 2: Verify this shift is available in the site's M2M assignments
+                    site_shifts = nearest_site.shifts.filter(id=assigned_shift.id, is_deleted=False)
+                    
+                    if site_shifts.exists():
+                        shift = assigned_shift
+                        logger.info(f"DEBUG: ✅ SELECTED assigned shift: {shift.shift_name} ({shift.start_time} - {shift.end_time}) [id={shift.id}]")
+                    else:
+                        # Employee's assigned shift is NOT available at this site
+                        shift = None
+                        logger.info(f"DEBUG: ❌ Employee's assigned shift {assigned_shift.id} is NOT in site's M2M table")
+                else:
+                    # No shift assignment found for the employee
+                    # They can check in/out at any time with no timing restrictions
+                    shift = None
+                    logger.info(f"DEBUG: ⚠️ No shift assignment for employee {matched_employee.id} - allowing check-in/out at any time")
+            except Exception as e:
+                logger.exception(f"ERROR fetching employee shift assignment: {e}")
+                shift = None
         else:
             # No site configured: allow attendance without geofence
             nearest_site = None
@@ -1516,19 +1522,17 @@ class FaceAttendanceView(APIView):
             start_dt = timezone.make_aware(start_dt_naive, tz)
             end_dt = timezone.make_aware(end_dt_naive, tz)
 
-            # ±1 hour window restriction: Allow attendance 1 hour before shift start to 1 hour after shift end
-            # Example: Shift 7am-7pm allows attendance from 6am-8pm
-            window_start = start_dt - timedelta(hours=1)
-            window_end = end_dt + timedelta(hours=1)
-            
-            if now_local < window_start or now_local > window_end:
+            # ✅ STRICT SHIFT TIMING: Enforce within shift window only (no ±1 hour grace)
+            # Employees can ONLY mark attendance during their assigned shift hours
+            if now_local < start_dt or now_local > end_dt:
                 return Response(
                     {
-                        "error": "Attendance not allowed outside shift window",
-                        "message": f"You can only mark attendance between {window_start.strftime('%I:%M %p')} and {window_end.strftime('%I:%M %p')}",
+                        "error": "Outside shift timing",
+                        "message": f"Your shift timing is {start_time.strftime('%I:%M %p')} - {end_time.strftime('%I:%M %p')} is over, please try in your shift.",
                         "shift_time": f"{start_time.strftime('%I:%M %p')} - {end_time.strftime('%I:%M %p')}",
-                        "allowed_window": f"{window_start.strftime('%I:%M %p')} - {window_end.strftime('%I:%M %p')}",
-                        "current_time": now_local.strftime('%I:%M %p')
+                        "current_time": now_local.strftime('%I:%M %p'),
+                        "shift_start": start_time.strftime('%I:%M %p'),
+                        "shift_end": end_time.strftime('%I:%M %p')
                     },
                     status=status.HTTP_403_FORBIDDEN
                 )
