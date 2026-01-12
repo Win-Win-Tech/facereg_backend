@@ -11,6 +11,8 @@ import re
 from decimal import Decimal, InvalidOperation
 from datetime import datetime, timedelta
 from calendar import monthrange
+from django.utils import timezone
+import pytz
 
 from regface.models import Employee, AttendanceLog
 
@@ -64,17 +66,86 @@ def calculate_attendance(employee, month):
             from leave.models import ManualAttendance, LeaveRequest, Holiday
             from leave.utils import is_weekoff_day
         except ImportError:
-            # If leave module not available, fall back to basic calculation
-            logs = AttendanceLog.objects.filter(
+            # If leave module not available, use duration-based calculation (same as attendance report)
+            # Get all attendance logs (both checkin and checkout)
+            all_logs = AttendanceLog.objects.filter(
                 employee=employee,
                 timestamp__date__gte=start_date,
-                timestamp__date__lte=end_date,
-                type=AttendanceLog.CHECKIN
-            )
-            present_dates = set(log.timestamp.date() for log in logs)
-            present_days = len(present_dates)
-            working_days = (end_date - start_date).days + 1
-            absent_days = working_days - present_days
+                timestamp__date__lte=end_date
+            ).order_by('timestamp')
+            
+            # Group logs by date
+            logs_by_date = {}
+            for log in all_logs:
+                log_date = log.timestamp.date()
+                if log_date not in logs_by_date:
+                    logs_by_date[log_date] = []
+                logs_by_date[log_date].append(log)
+            
+            # Calculate working days (exclude weekends at minimum)
+            total_days = (end_date - start_date).days + 1
+            working_days = 0
+            current = start_date
+            while current <= end_date:
+                if current.weekday() < 6:  # Monday=0, Sunday=6
+                    working_days += 1
+                current += timedelta(days=1)
+            
+            # Process each day with duration-based logic
+            for current_date in logs_by_date.keys():
+                date_logs = logs_by_date[current_date]
+                
+                # Separate checkins and checkouts
+                checkin_logs = sorted([log for log in date_logs if log.type == 'checkin'], key=lambda x: x.timestamp)
+                checkout_logs = sorted([log for log in date_logs if log.type == 'checkout'], key=lambda x: x.timestamp)
+                
+                # Calculate total duration by pairing checkins with checkouts
+                total_worked_seconds = 0
+                min_pairs = min(len(checkin_logs), len(checkout_logs))
+                
+                for i in range(min_pairs):
+                    checkin_log = checkin_logs[i]
+                    checkout_log = checkout_logs[i]
+                    
+                    if checkout_log.timestamp > checkin_log.timestamp:
+                        checkin_ts = checkin_log.timestamp
+                        checkout_ts = checkout_log.timestamp
+                        
+                        if timezone.is_naive(checkin_ts):
+                            checkin_ts = timezone.make_aware(checkin_ts, pytz.UTC)
+                        if timezone.is_naive(checkout_ts):
+                            checkout_ts = timezone.make_aware(checkout_ts, pytz.UTC)
+                        
+                        pair_duration = (checkout_ts - checkin_ts).total_seconds()
+                        if pair_duration > 0:
+                            total_worked_seconds += pair_duration
+                
+                # Determine status based on duration (same as attendance report)
+                if not checkin_logs:
+                    # No checkin = absent
+                    absent_days += Decimal('1')
+                elif not checkout_logs:
+                    # Checkin but no checkout = absent
+                    absent_days += Decimal('1')
+                elif total_worked_seconds < 3 * 3600:
+                    # < 3 hours = absent
+                    absent_days += Decimal('1')
+                elif total_worked_seconds < 6 * 3600:
+                    # 3-6 hours = half day
+                    present_days += Decimal('0.5')
+                    absent_days += Decimal('0.5')
+                else:
+                    # > 6 hours = present
+                    present_days += Decimal('1')
+            
+            # Count days without any logs as absent (only weekdays)
+            current_date = start_date
+            while current_date <= end_date:
+                if current_date not in logs_by_date:
+                    # Check if it's a weekend
+                    if current_date.weekday() < 6:  # Not a weekend (Monday=0, Sunday=6)
+                        absent_days += Decimal('1')
+                current_date += timedelta(days=1)
             
             return {
                 'present_days': float(present_days),
@@ -84,7 +155,7 @@ def calculate_attendance(employee, month):
                 'holiday_count': 0,
                 'weekoff_count': 0,
                 'working_days': working_days,
-                'total_days': working_days
+                'total_days': total_days
             }
         
         # Get all relevant data for the month
@@ -107,17 +178,24 @@ def calculate_attendance(employee, month):
             holiday_date__lte=end_date
         )
         
-        attendance_logs = AttendanceLog.objects.filter(
+        # Get all attendance logs (both checkin and checkout) for duration calculation
+        all_attendance_logs = AttendanceLog.objects.filter(
             employee=employee,
             timestamp__date__gte=start_date,
-            timestamp__date__lte=end_date,
-            type=AttendanceLog.CHECKIN
-        )
+            timestamp__date__lte=end_date
+        ).order_by('timestamp')
+        
+        # Group logs by date for duration calculation
+        logs_by_date = {}
+        for log in all_attendance_logs:
+            log_date = log.timestamp.date()
+            if log_date not in logs_by_date:
+                logs_by_date[log_date] = []
+            logs_by_date[log_date].append(log)
         
         # Create lookup dictionaries
         manual_dict = {ma.attendance_date: ma for ma in manual_attendances}
         holiday_set = {h.holiday_date for h in holidays}
-        attendance_set = {log.timestamp.date() for log in attendance_logs}
         
         # Create leave date set
         leave_dates = {}
@@ -169,9 +247,52 @@ def calculate_attendance(employee, month):
             elif is_weekoff_day(employee, current_date):
                 weekoff_count += 1
             
-            # Priority 5: Face Recognition Log
-            elif current_date in attendance_set:
-                present_days += Decimal('1')
+            # Priority 5: Face Recognition Log (with duration-based calculation)
+            elif current_date in logs_by_date:
+                date_logs = logs_by_date[current_date]
+                
+                # Separate checkins and checkouts
+                checkin_logs = sorted([log for log in date_logs if log.type == 'checkin'], key=lambda x: x.timestamp)
+                checkout_logs = sorted([log for log in date_logs if log.type == 'checkout'], key=lambda x: x.timestamp)
+                
+                # Calculate total duration by pairing checkins with checkouts
+                total_worked_seconds = 0
+                min_pairs = min(len(checkin_logs), len(checkout_logs))
+                
+                for i in range(min_pairs):
+                    checkin_log = checkin_logs[i]
+                    checkout_log = checkout_logs[i]
+                    
+                    if checkout_log.timestamp > checkin_log.timestamp:
+                        checkin_ts = checkin_log.timestamp
+                        checkout_ts = checkout_log.timestamp
+                        
+                        if timezone.is_naive(checkin_ts):
+                            checkin_ts = timezone.make_aware(checkin_ts, pytz.UTC)
+                        if timezone.is_naive(checkout_ts):
+                            checkout_ts = timezone.make_aware(checkout_ts, pytz.UTC)
+                        
+                        pair_duration = (checkout_ts - checkin_ts).total_seconds()
+                        if pair_duration > 0:
+                            total_worked_seconds += pair_duration
+                
+                # Determine status based on duration (same as attendance report)
+                if not checkin_logs:
+                    # No checkin = absent
+                    absent_days += Decimal('1')
+                elif not checkout_logs:
+                    # Checkin but no checkout = absent
+                    absent_days += Decimal('1')
+                elif total_worked_seconds < 3 * 3600:
+                    # < 3 hours = absent
+                    absent_days += Decimal('1')
+                elif total_worked_seconds < 6 * 3600:
+                    # 3-6 hours = half day
+                    present_days += Decimal('0.5')
+                    absent_days += Decimal('0.5')
+                else:
+                    # > 6 hours = present
+                    present_days += Decimal('1')
             
             # Priority 6: Absent
             else:
@@ -314,11 +435,11 @@ def calculate_payslip_fields(employee, field_config, month):
     # Get gross salary
     gross_salary = employee.gross_salary or employee.base_salary or Decimal('0')
     
-    # Calculate deduction_per_day based on total calendar days
-    # Formula: gross_salary / total_days (30/31/28/29)
-    total_days = attendance['total_days']
-    if total_days > 0:
-        deduction_per_day = float(gross_salary) / total_days
+    # Calculate deduction_per_day based on working days (not total days)
+    # Formula: gross_salary / working_days (excludes holidays and weekoffs)
+    working_days = attendance['working_days']
+    if working_days > 0:
+        deduction_per_day = float(gross_salary) / working_days
     else:
         deduction_per_day = 0.0
     
@@ -333,7 +454,7 @@ def calculate_payslip_fields(employee, field_config, month):
         'weekoff_count': attendance['weekoff_count'],
         'working_days': attendance['working_days'],
         'total_days': attendance['total_days'],
-        'deduction_per_day': deduction_per_day,  # Auto-calculated: gross_salary / total_days
+        'deduction_per_day': deduction_per_day,  # Auto-calculated: gross_salary / working_days
         'month': month,
         'base_salary': float(employee.base_salary or Decimal('0')),
     }
