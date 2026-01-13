@@ -3,7 +3,9 @@ from calendar import monthrange
 from decimal import Decimal
 from datetime import datetime
 import os
+import time
 
+from django.db import connection
 from django.db.models import Q
 from django.http import FileResponse, Http404
 from django.conf import settings
@@ -200,10 +202,18 @@ class PayslipTemplatePreviewView(AuthenticatedAPIView):
                     if 'BASIC' in field.field_code: dummy_values[field.field_code] = 30000
                     elif 'HRA' in field.field_code: dummy_values[field.field_code] = 12000
                     else: dummy_values[field.field_code] = 5000
-                else: # DEDUCTION
+                elif field.field_type == 'DEDUCTION':
                     if 'PF' in field.field_code: dummy_values[field.field_code] = 3600
                     elif 'ESI' in field.field_code: dummy_values[field.field_code] = 500
                     else: dummy_values[field.field_code] = 1000
+                elif field.field_type == 'INFO':
+                    # Generate dummy values for INFO fields based on common field codes
+                    if 'absent' in field.field_code.lower(): dummy_values[field.field_code] = 2
+                    elif 'present' in field.field_code.lower(): dummy_values[field.field_code] = 28
+                    elif 'leave' in field.field_code.lower() or 'lop' in field.field_code.lower(): dummy_values[field.field_code] = 1
+                    elif 'paid_leave' in field.field_code.lower(): dummy_values[field.field_code] = 2
+                    elif 'unpaid_leave' in field.field_code.lower(): dummy_values[field.field_code] = 1
+                    else: dummy_values[field.field_code] = 0  # Default for other INFO fields
             
             dummy_payslip_data['field_values'] = dummy_values
             
@@ -569,30 +579,77 @@ class PayslipFieldBulkDeleteView(AuthenticatedAPIView):
 
 class PayslipRecordListView(AuthenticatedAPIView):
     def get(self, request):
-        month = request.query_params.get('month')
-        employee_id = request.query_params.get('employee_id')
-        location_id = request.query_params.get('location_id')
+        max_retries = 2
+        retry_count = 0
         
-        records = PayslipRecord.objects.all()
+        while retry_count <= max_retries:
+            try:
+                # Ensure database connection is alive
+                connection.ensure_connection()
+                
+                month = request.query_params.get('month')
+                employee_id = request.query_params.get('employee_id')
+                location_id = request.query_params.get('location_id')
+                
+                # Start with base queryset - use select_related only for essential relations
+                # Limit select_related to avoid connection timeouts on large datasets
+                records = PayslipRecord.objects.select_related('employee', 'field_config', 'template').all()
+                
+                if request.user.role == User.Role.ADMIN:
+                    if not request.user.location_id:
+                        return Response(
+                            {"detail": "Admin user is not assigned to a location."},
+                            status=status.HTTP_400_BAD_REQUEST,
+                        )
+                    # Admin sees payslips for employees in their location
+                    records = records.filter(employee__location=request.user.location)
+                elif location_id:
+                    records = records.filter(employee__location_id=location_id)
+                
+                if month:
+                    records = records.filter(month=month)
+                if employee_id:
+                    records = records.filter(employee_id=employee_id)
+                
+                # Order by month and employee name for consistent results
+                records = records.order_by('-month', 'employee__name')
+                
+                # Serialize the queryset
+                serializer = PayslipRecordSerializer(records, many=True)
+                return Response(serializer.data)
+                
+            except Exception as e:
+                error_msg = str(e)
+                is_connection_error = 'Lost connection' in error_msg or '2013' in error_msg or 'OperationalError' in str(type(e).__name__)
+                
+                if is_connection_error and retry_count < max_retries:
+                    retry_count += 1
+                    logger.warning(f"Database connection error (attempt {retry_count}/{max_retries}): {error_msg}")
+                    # Close the broken connection
+                    try:
+                        connection.close()
+                    except:
+                        pass
+                    # Wait a bit before retrying
+                    time.sleep(0.5)
+                    continue
+                else:
+                    logger.error(f"Error in PayslipRecordListView: {error_msg}", exc_info=True)
+                    if is_connection_error:
+                        return Response(
+                            {"detail": "Database connection error. Please try again."},
+                            status=status.HTTP_503_SERVICE_UNAVAILABLE
+                        )
+                    return Response(
+                        {"detail": f"An error occurred while fetching payslip records: {error_msg}"},
+                        status=status.HTTP_500_INTERNAL_SERVER_ERROR
+                    )
         
-        if request.user.role == User.Role.ADMIN:
-            if not request.user.location_id:
-                return Response(
-                    {"detail": "Admin user is not assigned to a location."},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-            # Admin sees payslips for employees in their location
-            records = records.filter(employee__location=request.user.location)
-        elif location_id:
-            records = records.filter(employee__location_id=location_id)
-        
-        if month:
-            records = records.filter(month=month)
-        if employee_id:
-            records = records.filter(employee_id=employee_id)
-        
-        serializer = PayslipRecordSerializer(records, many=True)
-        return Response(serializer.data)
+        # If we exhausted retries
+        return Response(
+            {"detail": "Database connection error after multiple retries. Please try again later."},
+            status=status.HTTP_503_SERVICE_UNAVAILABLE
+        )
 
 
 class PayslipRecordDetailView(AuthenticatedAPIView):

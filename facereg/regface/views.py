@@ -1,6 +1,7 @@
 import base64
 import logging
 import os
+import time
 from calendar import monthrange
 from collections import defaultdict
 from datetime import date, datetime, timedelta
@@ -9,6 +10,7 @@ from decimal import Decimal
 import face_recognition
 import numpy as np
 from django.conf import settings
+from django.db import connection
 from django.db.models import Min, Max
 from django.utils import timezone
 from django.utils.timezone import localtime
@@ -144,19 +146,60 @@ class TimezoneListView(APIView):
 
 class LocationListCreateView(AuthenticatedAPIView):
     def get(self, request):
-        include_deleted = request.query_params.get("include_deleted") == "true"
-        locations = Location.objects.all()
-        if not is_superadmin(request.user):
-            if not request.user.location_id:
-                return Response(
-                    {"detail": "Admin user is not assigned to a location."},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-            locations = locations.filter(pk=request.user.location_id, is_deleted=False)
-        elif not include_deleted:
-            locations = locations.filter(is_deleted=False)
-        serializer = LocationSerializer(locations, many=True)
-        return Response(serializer.data)
+        max_retries = 2
+        retry_count = 0
+        
+        while retry_count <= max_retries:
+            try:
+                # Ensure database connection is alive
+                connection.ensure_connection()
+                
+                include_deleted = request.query_params.get("include_deleted") == "true"
+                locations = Location.objects.all()
+                if not is_superadmin(request.user):
+                    if not request.user.location_id:
+                        return Response(
+                            {"detail": "Admin user is not assigned to a location."},
+                            status=status.HTTP_400_BAD_REQUEST,
+                        )
+                    locations = locations.filter(pk=request.user.location_id, is_deleted=False)
+                elif not include_deleted:
+                    locations = locations.filter(is_deleted=False)
+                serializer = LocationSerializer(locations, many=True)
+                return Response(serializer.data)
+                
+            except Exception as e:
+                error_msg = str(e)
+                is_connection_error = 'Lost connection' in error_msg or '2013' in error_msg or 'OperationalError' in str(type(e).__name__)
+                
+                if is_connection_error and retry_count < max_retries:
+                    retry_count += 1
+                    logger.warning(f"Database connection error in LocationListCreateView (attempt {retry_count}/{max_retries}): {error_msg}")
+                    # Close the broken connection
+                    try:
+                        connection.close()
+                    except:
+                        pass
+                    # Wait a bit before retrying
+                    time.sleep(0.5)
+                    continue
+                else:
+                    logger.error(f"Error in LocationListCreateView: {error_msg}", exc_info=True)
+                    if is_connection_error:
+                        return Response(
+                            {"detail": "Database connection error. Please try again."},
+                            status=status.HTTP_503_SERVICE_UNAVAILABLE
+                        )
+                    return Response(
+                        {"detail": f"An error occurred: {error_msg}"},
+                        status=status.HTTP_500_INTERNAL_SERVER_ERROR
+                    )
+        
+        # If we exhausted retries
+        return Response(
+            {"detail": "Database connection error after multiple retries. Please try again later."},
+            status=status.HTTP_503_SERVICE_UNAVAILABLE
+        )
 
     def post(self, request):
         if not is_superadmin(request.user):
@@ -485,9 +528,24 @@ class ShiftListCreateView(AuthenticatedAPIView):
 
         - Single shift: POST /api/shifts/ with a JSON object
         - Bulk shifts:  POST /api/shifts/ with a JSON array of objects
+        
+        For admin users: If location_id is not provided, automatically set it to the admin's location.
         """
         data = request.data
         many = isinstance(data, list)
+        
+        # Auto-set location_id for admin users if not provided
+        if request.user.role == User.Role.ADMIN and request.user.location_id:
+            if many:
+                # Bulk creation: add location_id to each shift if not present
+                for shift_data in data:
+                    if 'location_id' not in shift_data or not shift_data.get('location_id'):
+                        shift_data['location_id'] = str(request.user.location_id)
+            else:
+                # Single shift: add location_id if not present
+                if 'location_id' not in data or not data.get('location_id'):
+                    data = data.copy()
+                    data['location_id'] = str(request.user.location_id)
 
         serializer = ShiftSerializer(data=data, many=many)
         if serializer.is_valid():
@@ -1421,13 +1479,16 @@ class FaceAttendanceView(APIView):
                         logger.info(f"DEBUG: ✅ SELECTED assigned shift: {shift.shift_name} ({shift.start_time} - {shift.end_time}) [id={shift.id}]")
                     else:
                         # Employee's assigned shift is NOT available at this site
+                        # NOTE: We do NOT fallback to location shift (Priority 3 commented out)
+                        # Employee must have a valid assignment to use shift timing restrictions
                         shift = None
-                        logger.info(f"DEBUG: ❌ Employee's assigned shift {assigned_shift.id} is NOT in site's M2M table")
+                        logger.info(f"DEBUG: ❌ Employee's assigned shift {assigned_shift.id} is NOT in site's M2M table - allowing check-in/out at any time")
                 else:
                     # No shift assignment found for the employee
+                    # NOTE: We do NOT fallback to location shift (Priority 3 commented out)
                     # They can check in/out at any time with no timing restrictions
                     shift = None
-                    logger.info(f"DEBUG: ⚠️ No shift assignment for employee {matched_employee.id} - allowing check-in/out at any time")
+                    logger.info(f"DEBUG: ⚠️ No shift assignment for employee {matched_employee.id} - allowing check-in/out at any time (Priority 3 location shift fallback disabled)")
             except Exception as e:
                 logger.exception(f"ERROR fetching employee shift assignment: {e}")
                 shift = None

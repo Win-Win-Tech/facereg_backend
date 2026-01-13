@@ -257,6 +257,7 @@ def generate_payslip_pdf(payslip_data, template_data=None, field_config=None):
     # Earnings & Deductions Data
     earnings = []
     deductions = []
+    info_fields = []
     field_values = payslip_data.get('field_values', {})
     
     if field_config:
@@ -264,11 +265,20 @@ def generate_payslip_pdf(payslip_data, template_data=None, field_config=None):
         for field in fields:
             if not field.is_visible: continue
             val_amount = field_values.get(field.field_code, 0)
-            formatted_val = f"{val_amount:,.2f}" if val_amount else "0.00"
+            
             if field.field_type == 'EARNING':
+                formatted_val = f"{val_amount:,.2f}" if val_amount else "0.00"
                 earnings.append((field.field_name, formatted_val))
             elif field.field_type == 'DEDUCTION':
+                formatted_val = f"{val_amount:,.2f}" if val_amount else "0.00"
                 deductions.append((field.field_name, formatted_val))
+            elif field.field_type == 'INFO':
+                # For INFO fields, format based on value type - could be number, text, or calculation result
+                if isinstance(val_amount, (int, float)):
+                    formatted_val = f"{val_amount:,.2f}" if val_amount else "0.00"
+                else:
+                    formatted_val = str(val_amount) if val_amount else "—"
+                info_fields.append((field.field_name, formatted_val))
     else:
         if payslip_data.get('gross_salary'):
              earnings.append(('Basic Salary', f"{payslip_data.get('gross_salary', 0):,.2f}"))
@@ -313,6 +323,19 @@ def generate_payslip_pdf(payslip_data, template_data=None, field_config=None):
     main_data.append([
         Paragraph("<b>Net Pay (A - B)</b>", style_bold_left), '', '', Paragraph(f"<b>{net_pay:,.2f}</b>", style_bold_right)
     ])
+    
+    # Information Fields Section (if any INFO fields exist)
+    if info_fields:
+        main_data.append(['', '', '', ''])  # Empty row for spacing
+        main_data.append([
+            Paragraph("<b>Information</b>", style_bold_left), '',
+            Paragraph("<b>Value</b>", style_bold_left), ''
+        ])
+        for info_name, info_value in info_fields:
+            main_data.append([
+                lbl(info_name), val(info_value),
+                '', ''
+            ])
     
     # Amount in Words
     amount_words = ""

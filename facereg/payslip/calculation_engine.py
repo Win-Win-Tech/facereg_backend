@@ -147,6 +147,10 @@ def calculate_attendance(employee, month):
                         absent_days += Decimal('1')
                 current_date += timedelta(days=1)
             
+            # Validation: If employee has 0 present days, all working days should be absent
+            if present_days == 0:
+                absent_days = Decimal(str(working_days))
+            
             return {
                 'present_days': float(present_days),
                 'absent_days': float(absent_days),
@@ -304,6 +308,28 @@ def calculate_attendance(employee, month):
         total_days = (end_date - start_date).days + 1
         working_days = total_days - holiday_count - weekoff_count
         
+        # CRITICAL VALIDATION: If employee has 0 present days and no paid leaves, 
+        # ALL working days must be counted as absent
+        # This handles cases where:
+        # 1. Employee didn't show up at all
+        # 2. Employee marked attendance but didn't meet work threshold (< 3 hours per day)
+        if float(present_days) == 0.0 and paid_leave_days == 0:
+            absent_days = Decimal(str(working_days))
+        else:
+            # Ensure all working days are accounted for
+            # Calculate total accounted days
+            total_accounted = present_days + absent_days + Decimal(str(paid_leave_days)) + Decimal(str(unpaid_leave_days))
+            
+            if total_accounted < working_days:
+                # If there's a discrepancy (some days not accounted for), add remaining days to absent_days
+                # This ensures: present_days + absent_days + paid_leave_days + unpaid_leave_days = working_days
+                absent_days += (Decimal(str(working_days)) - total_accounted)
+            elif total_accounted > working_days:
+                # If over-accounted (shouldn't happen, but handle gracefully), adjust absent_days
+                excess = total_accounted - Decimal(str(working_days))
+                if absent_days >= excess:
+                    absent_days -= excess
+        
         return {
             'present_days': float(present_days),  # Can be decimal like 28.5
             'absent_days': float(absent_days),    # Can be decimal like 1.5
@@ -345,6 +371,13 @@ def evaluate_formula(formula, context):
     
     formula = formula.strip()
     
+    # Special case: If formula is just a variable name (no operators), return value directly
+    # This handles cases like "absent_days" or "ABSENT_DAYS" where it's just referencing a context variable
+    formula_upper = formula.upper()
+    for key in context.keys():
+        if key.upper() == formula_upper:
+            return Decimal(str(context[key]))
+    
     # Replace variable names with their values from context
     # First, sort by length (longest first) to avoid partial replacements
     sorted_keys = sorted(context.keys(), key=len, reverse=True)
@@ -352,9 +385,10 @@ def evaluate_formula(formula, context):
     for key in sorted_keys:
         if key in context:
             value = context[key]
-            # Use word boundaries to ensure exact matches
+            # Use word boundaries to ensure exact matches (case-insensitive)
+            # This handles cases where formula uses "ABSENT_DAYS" but context has "absent_days"
             pattern = r'\b' + re.escape(str(key)) + r'\b'
-            formula = re.sub(pattern, str(float(value)), formula)
+            formula = re.sub(pattern, str(float(value)), formula, flags=re.IGNORECASE)
     
     # Replace common operations
     formula = formula.replace('*', '*').replace('/', '/').replace('+', '+').replace('-', '-')
@@ -390,16 +424,25 @@ def calculate_field_value(field, context):
     
     try:
         if value_type == 'PERCENTAGE':
-            # Percentage of gross_salary
+            # Percentage of pro-rated gross_salary (already adjusted for attendance)
             percentage = Decimal(value_str)
             if 'gross_salary' not in context:
                 raise CalculationError("gross_salary not found in context for percentage calculation")
-            gross = Decimal(str(context['gross_salary']))
+            gross = Decimal(str(context['gross_salary']))  # This is already pro-rated
             return (gross * percentage / 100).quantize(Decimal('0.01'))
         
         elif value_type == 'FIXED':
-            # Fixed amount
-            return Decimal(value_str).quantize(Decimal('0.01'))
+            # Fixed amount - pro-rate based on net_payable_days / working_days
+            fixed_amount = Decimal(value_str)
+            if 'net_payable_days' in context and 'working_days' in context:
+                net_payable = Decimal(str(context['net_payable_days']))
+                working_days = Decimal(str(context['working_days']))
+                if working_days > 0:
+                    # Pro-rate fixed amount: (fixed_amount / working_days) * net_payable_days
+                    pro_rated = (fixed_amount / working_days) * net_payable
+                    return pro_rated.quantize(Decimal('0.01'))
+            # Fallback to full amount if pro-rating not possible
+            return fixed_amount.quantize(Decimal('0.01'))
         
         elif value_type == 'CALCULATION':
             # Formula-based calculation
@@ -435,17 +478,30 @@ def calculate_payslip_fields(employee, field_config, month):
     # Get gross salary
     gross_salary = employee.gross_salary or employee.base_salary or Decimal('0')
     
-    # Calculate deduction_per_day based on working days (not total days)
-    # Formula: gross_salary / working_days (excludes holidays and weekoffs)
+    # Calculate net payable days (days for which employee should be paid)
+    # Net payable = present_days + paid_leave_days (holidays and weekoffs are already excluded from working_days)
+    present_days = Decimal(str(attendance['present_days']))
+    paid_leave_days = Decimal(str(attendance['paid_leave_days']))
+    net_payable_days = present_days + paid_leave_days
+    
+    # Calculate working days (excludes holidays and weekoffs)
     working_days = attendance['working_days']
+    
+    # Calculate pro-rated gross salary based on net payable days
+    # Formula: (gross_salary / working_days) * net_payable_days
     if working_days > 0:
-        deduction_per_day = float(gross_salary) / working_days
+        salary_per_day = float(gross_salary) / working_days
+        pro_rated_gross_salary = salary_per_day * float(net_payable_days)
+        deduction_per_day = salary_per_day
     else:
+        pro_rated_gross_salary = 0.0
         deduction_per_day = 0.0
     
     # Build initial context with employee data
+    # Use pro_rated_gross_salary for all calculations so earnings are based on actual attendance
     context = {
-        'gross_salary': float(gross_salary),
+        'gross_salary': pro_rated_gross_salary,  # Pro-rated based on net_payable_days
+        'base_gross_salary': float(gross_salary),  # Original gross salary (for reference)
         'present_days': attendance['present_days'],  # Can be decimal (28.5)
         'absent_days': attendance['absent_days'],    # Can be decimal (1.5)
         'paid_leave_days': attendance['paid_leave_days'],
@@ -454,6 +510,7 @@ def calculate_payslip_fields(employee, field_config, month):
         'weekoff_count': attendance['weekoff_count'],
         'working_days': attendance['working_days'],
         'total_days': attendance['total_days'],
+        'net_payable_days': float(net_payable_days),  # Days for which employee should be paid
         'deduction_per_day': deduction_per_day,  # Auto-calculated: gross_salary / working_days
         'month': month,
         'base_salary': float(employee.base_salary or Decimal('0')),
