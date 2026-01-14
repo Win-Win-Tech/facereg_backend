@@ -33,6 +33,227 @@ from .pdf_generator import generate_payslip_pdf
 logger = logging.getLogger(__name__)
 
 
+# ==================== Default Salary Config Template ====================
+
+def get_default_salary_config_template():
+    """
+    Returns the default salary config template with basic earning, deduction, and information fields.
+    This template will be used for locations that don't have a salary config.
+    """
+    return {
+        'config_name': 'Default Salary Config',
+        'description': 'Default salary configuration with basic earning, deduction, and information fields',
+        'fields': [
+            # Earning Fields
+            {
+                'field_name': 'Basic Salary',
+                'field_code': 'BASIC',
+                'field_type': 'EARNING',
+                'value_type': 'PERCENTAGE',
+                'value': '60',  # 60% of gross salary
+                'display_order': 1,
+                'is_visible': True,
+            },
+            {
+                'field_name': 'House Rent Allowance',
+                'field_code': 'HRA',
+                'field_type': 'EARNING',
+                'value_type': 'PERCENTAGE',
+                'value': '20',  # 20% of gross salary
+                'display_order': 2,
+                'is_visible': True,
+            },
+            {
+                'field_name': 'Transport Allowance',
+                'field_code': 'TRANSPORT',
+                'field_type': 'EARNING',
+                'value_type': 'FIXED',
+                'value': '2000',  # Fixed amount
+                'display_order': 3,
+                'is_visible': True,
+            },
+            {
+                'field_name': 'Medical Allowance',
+                'field_code': 'MEDICAL',
+                'field_type': 'EARNING',
+                'value_type': 'FIXED',
+                'value': '1500',  # Fixed amount
+                'display_order': 4,
+                'is_visible': True,
+            },
+            # Deduction Fields
+            {
+                'field_name': 'Provident Fund',
+                'field_code': 'PF',
+                'field_type': 'DEDUCTION',
+                'value_type': 'PERCENTAGE',
+                'value': '12',  # 12% of basic salary
+                'display_order': 5,
+                'is_visible': True,
+            },
+            {
+                'field_name': 'Professional Tax',
+                'field_code': 'PT',
+                'field_type': 'DEDUCTION',
+                'value_type': 'FIXED',
+                'value': '200',  # Fixed amount
+                'display_order': 6,
+                'is_visible': True,
+            },
+            {
+                'field_name': 'Absent Deduction',
+                'field_code': 'ABSENT_DEDUCTION',
+                'field_type': 'DEDUCTION',
+                'value_type': 'CALCULATION',
+                'value': 'absent_days * deduction_per_day',  # Calculation based on absent days
+                'display_order': 7,
+                'is_visible': True,
+            },
+            {
+                'field_name': 'Employee State Insurance',
+                'field_code': 'ESI',
+                'field_type': 'DEDUCTION',
+                'value_type': 'PERCENTAGE',
+                'value': '0.75',  # 0.75% of gross salary (employee contribution)
+                'display_order': 8,
+                'is_visible': True,
+            },
+            # Information Fields
+            {
+                'field_name': 'Present Days',
+                'field_code': 'PRESENT_DAYS',
+                'field_type': 'INFO',
+                'value_type': 'FIXED',
+                'value': 'present_days',  # Reference to attendance data
+                'display_order': 9,
+                'is_visible': True,
+            },
+            {
+                'field_name': 'Absent Days',
+                'field_code': 'ABSENT_DAYS',
+                'field_type': 'INFO',
+                'value_type': 'FIXED',
+                'value': 'absent_days',  # Reference to attendance data
+                'display_order': 10,
+                'is_visible': True,
+            },
+            {
+                'field_name': 'Employee ID',
+                'field_code': 'EMP_ID',
+                'field_type': 'INFO',
+                'value_type': 'FIXED',
+                'value': 'employee.employee_id',  # Reference to employee field
+                'display_order': 11,
+                'is_visible': True,
+            },
+            {
+                'field_name': 'Department',
+                'field_code': 'DEPT',
+                'field_type': 'INFO',
+                'value_type': 'FIXED',
+                'value': 'employee.department',  # Reference to employee field
+                'display_order': 12,
+                'is_visible': True,
+            },
+            {
+                'field_name': 'Designation',
+                'field_code': 'DESIGNATION',
+                'field_type': 'INFO',
+                'value_type': 'FIXED',
+                'value': 'employee.designation',  # Reference to employee field
+                'display_order': 13,
+                'is_visible': True,
+            },
+        ]
+    }
+
+
+def create_default_salary_config_for_location(location, created_by=None):
+    """
+    Creates a default salary config for a location if it doesn't already have one.
+    
+    Args:
+        location: Location instance
+        created_by: User instance (optional)
+    
+    Returns:
+        tuple: (config_instance, created_boolean) - Returns the config and whether it was created
+    """
+    # Check if location already has a config
+    existing_config = PayslipFieldConfig.objects.filter(
+        location=location,
+        is_deleted=False
+    ).first()
+    
+    if existing_config:
+        return existing_config, False
+    
+    # Get default template
+    template = get_default_salary_config_template()
+    
+    # Create the config
+    config = PayslipFieldConfig.objects.create(
+        location=location,
+        config_name=template['config_name'],
+        description=template['description'],
+        is_active=True,
+        created_by=created_by
+    )
+    
+    # Create all fields
+    for field_data in template['fields']:
+        PayslipField.objects.create(
+            field_config=config,
+            field_name=field_data['field_name'],
+            field_code=field_data['field_code'],
+            field_type=field_data['field_type'],
+            value_type=field_data['value_type'],
+            value=field_data['value'],
+            display_order=field_data['display_order'],
+            is_visible=field_data['is_visible']
+        )
+    
+    return config, True
+
+
+def create_default_salary_configs_for_all_locations(created_by=None):
+    """
+    Checks all locations and creates default salary configs for locations that don't have one.
+    
+    Args:
+        created_by: User instance (optional)
+    
+    Returns:
+        dict: {
+            'total_locations': int,
+            'locations_with_config': int,
+            'locations_created': int,
+            'created_configs': list of config names
+        }
+    """
+    all_locations = Location.objects.filter(is_deleted=False)
+    total_locations = all_locations.count()
+    
+    locations_with_config = 0
+    locations_created = 0
+    created_configs = []
+    
+    for location in all_locations:
+        config, was_created = create_default_salary_config_for_location(location, created_by)
+        if was_created:
+            locations_created += 1
+            created_configs.append(f"{config.config_name} - {location.name}")
+        else:
+            locations_with_config += 1
+    
+    return {
+        'total_locations': total_locations,
+        'locations_with_config': locations_with_config,
+        'locations_created': locations_created,
+        'created_configs': created_configs
+    }
+
+
 # ==================== PayslipTemplate APIs ====================
 
 class PayslipTemplateListCreateView(AuthenticatedAPIView):
@@ -355,6 +576,25 @@ class PayslipFieldListCreateView(AuthenticatedAPIView):
         if data.get('field_code'):
             data['field_code'] = data['field_code'].upper()
         
+        # Check if field with same field_code already exists (excluding soft-deleted)
+        field_code = data.get('field_code')
+        if field_code:
+            existing_field = PayslipField.objects.filter(
+                field_config=config,
+                field_code=field_code,
+                is_deleted=False
+            ).first()
+            
+            if existing_field:
+                return Response(
+                    {
+                        "non_field_errors": [
+                            f"A field with code '{field_code}' already exists. Please use a different field code."
+                        ]
+                    },
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+        
         serializer = PayslipFieldSerializer(data=data)
         if serializer.is_valid():
             serializer.save()
@@ -428,29 +668,82 @@ class PayslipFieldBulkCreateView(AuthenticatedAPIView):
         if serializer.is_valid():
             fields_data = serializer.validated_data['fields']
             created_fields = []
-            for field_data in fields_data:
-                # Auto-generate field_code if not provided
-                if not field_data.get('field_code') or field_data.get('field_code').strip() == '':
-                    field_name = field_data.get('field_name', '')
-                    if field_name:
-                        # Convert "Basic Salary" to "BASIC_SALARY"
-                        field_code = field_name.upper().replace(' ', '_').replace('-', '_')
-                        field_code = ''.join(c for c in field_code if c.isalnum() or c == '_')
-                        while '__' in field_code:
-                            field_code = field_code.replace('__', '_')
-                        field_code = field_code.strip('_')
-                        field_data['field_code'] = field_code
-                
-                # Ensure field_code is uppercase
-                if field_data.get('field_code'):
-                    field_data['field_code'] = field_data['field_code'].upper()
-                
-                # field_config is already set by serializer validation (from field_config_id)
-                field = PayslipField.objects.create(**field_data)
-                created_fields.append(field)
+            failed_fields = []
             
-            result_serializer = PayslipFieldSerializer(created_fields, many=True)
-            return Response(result_serializer.data, status=status.HTTP_201_CREATED)
+            for idx, field_data in enumerate(fields_data):
+                field_name = field_data.get('field_name', 'Unknown')
+                error_reason = None
+                
+                try:
+                    # Auto-generate field_code if not provided
+                    if not field_data.get('field_code') or field_data.get('field_code').strip() == '':
+                        if field_name:
+                            # Convert "Basic Salary" to "BASIC_SALARY"
+                            field_code = field_name.upper().replace(' ', '_').replace('-', '_')
+                            field_code = ''.join(c for c in field_code if c.isalnum() or c == '_')
+                            while '__' in field_code:
+                                field_code = field_code.replace('__', '_')
+                            field_code = field_code.strip('_')
+                            field_data['field_code'] = field_code
+                    
+                    # Ensure field_code is uppercase
+                    if field_data.get('field_code'):
+                        field_data['field_code'] = field_data['field_code'].upper()
+                    
+                    # Check if field with same field_code already exists (excluding soft-deleted)
+                    field_code = field_data.get('field_code')
+                    if field_code:
+                        existing_field = PayslipField.objects.filter(
+                            field_config=config,
+                            field_code=field_code,
+                            is_deleted=False
+                        ).first()
+                        
+                        if existing_field:
+                            error_reason = f'Duplicate code: {field_code}'
+                            failed_fields.append({
+                                'field_name': field_name,
+                                'field_code': field_code,
+                                'reason': error_reason
+                            })
+                            continue
+                    
+                    # Create the field
+                    field = PayslipField.objects.create(**field_data)
+                    created_fields.append(field)
+                    
+                except Exception as e:
+                    # Catch any other errors during creation
+                    error_reason = str(e)[:100] if str(e) else 'Unknown error'
+                    failed_fields.append({
+                        'field_name': field_name,
+                        'field_code': field_data.get('field_code', 'N/A'),
+                        'reason': error_reason
+                    })
+                    continue
+            
+            # Prepare response
+            created_count = len(created_fields)
+            failed_count = len(failed_fields)
+            
+            result_data = {
+                'created_count': created_count,
+                'failed_count': failed_count,
+                'total_count': len(fields_data),
+                'created': PayslipFieldSerializer(created_fields, many=True).data if created_fields else [],
+                'failed': failed_fields if failed_fields else []
+            }
+            
+            # Return appropriate status code
+            if failed_count > 0 and created_count > 0:
+                # Partial success
+                return Response(result_data, status=status.HTTP_207_MULTI_STATUS)
+            elif failed_count > 0 and created_count == 0:
+                # All failed
+                return Response(result_data, status=status.HTTP_400_BAD_REQUEST)
+            else:
+                # All succeeded
+                return Response(result_data, status=status.HTTP_201_CREATED)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 
@@ -1109,5 +1402,91 @@ class PayslipDownloadView(AuthenticatedAPIView):
             logger.error(f"Error generating PDF: {e}", exc_info=True)
             return Response(
                 {"detail": f"Error generating PDF: {str(e)}"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+
+# ==================== Default Salary Config Management APIs ====================
+
+class CreateDefaultSalaryConfigsView(AuthenticatedAPIView):
+    """
+    API endpoint to create default salary configs for all locations that don't have one.
+    Only accessible by superadmin.
+    """
+    def post(self, request):
+        if not is_superadmin(request.user):
+            return Response(
+                {"detail": "Only superadmin can create default configs for all locations."},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        
+        try:
+            result = create_default_salary_configs_for_all_locations(created_by=request.user)
+            
+            return Response({
+                "message": f"Default salary configs created successfully. {result['locations_created']} new configs created.",
+                "details": result
+            }, status=status.HTTP_200_OK)
+            
+        except Exception as e:
+            logger.error(f"Error creating default salary configs: {e}", exc_info=True)
+            return Response(
+                {"detail": f"Error creating default salary configs: {str(e)}"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+
+class CreateDefaultSalaryConfigForLocationView(AuthenticatedAPIView):
+    """
+    API endpoint to create default salary config for a specific location.
+    """
+    def post(self, request):
+        location_id = request.data.get('location_id')
+        
+        if not location_id:
+            return Response(
+                {"detail": "location_id is required."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Check permissions
+        if request.user.role == User.Role.ADMIN:
+            if not request.user.location_id or str(request.user.location_id) != str(location_id):
+                return Response(
+                    {"detail": "You can only create configs for your own location."},
+                    status=status.HTTP_403_FORBIDDEN
+                )
+        
+        try:
+            location = Location.objects.get(id=location_id, is_deleted=False)
+        except Location.DoesNotExist:
+            return Response(
+                {"detail": "Location not found."},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        
+        try:
+            config, was_created = create_default_salary_config_for_location(
+                location, 
+                created_by=request.user
+            )
+            
+            if was_created:
+                serializer = PayslipFieldConfigSerializer(config)
+                return Response({
+                    "message": f"Default salary config created successfully for {location.name}.",
+                    "config": serializer.data
+                }, status=status.HTTP_201_CREATED)
+            else:
+                serializer = PayslipFieldConfigSerializer(config)
+                return Response({
+                    "message": f"Location {location.name} already has a salary config.",
+                    "config": serializer.data
+                }, status=status.HTTP_200_OK)
+            
+        except Exception as e:
+            logger.error(f"Error creating default salary config: {e}", exc_info=True)
+            return Response(
+                {"detail": f"Error creating default salary config: {str(e)}"},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )

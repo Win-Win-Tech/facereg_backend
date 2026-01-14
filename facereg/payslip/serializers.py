@@ -92,12 +92,44 @@ class PayslipFieldSerializer(serializers.ModelSerializer):
     
     def validate(self, attrs):
         """Validate field_code changes - check if referenced in calculations"""
+        field_config = attrs.get('field_config') or (self.instance.field_config if self.instance else None)
+        field_code = attrs.get('field_code')
+        
+        if not field_config:
+            return attrs
+        
+        # For new fields, check if field_code already exists (excluding soft-deleted)
+        if not self.instance and field_code:
+            existing_field = PayslipField.objects.filter(
+                field_config=field_config,
+                field_code=field_code,
+                is_deleted=False
+            ).first()
+            
+            if existing_field:
+                raise serializers.ValidationError({
+                    'field_code': f'A field with code "{field_code}" already exists. Please use a different field code or restore the deleted field.'
+                })
+        
+        # For updates, check if field_code changes and if referenced in calculations
         if self.instance and 'field_code' in attrs:
             # This should not happen if field_code is read_only, but double-check
             old_code = self.instance.field_code
             new_code = attrs.get('field_code', old_code)
             
             if old_code != new_code:
+                # Check if new_code already exists (excluding soft-deleted and current field)
+                existing_field = PayslipField.objects.filter(
+                    field_config=self.instance.field_config,
+                    field_code=new_code,
+                    is_deleted=False
+                ).exclude(id=self.instance.id).first()
+                
+                if existing_field:
+                    raise serializers.ValidationError({
+                        'field_code': f'A field with code "{new_code}" already exists. Please use a different field code.'
+                    })
+                
                 # Check if any field references this code in calculations
                 referencing_fields = PayslipField.objects.filter(
                     field_config=self.instance.field_config,

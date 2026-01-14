@@ -1990,7 +1990,7 @@ class RegisterEmployeeView(AuthenticatedAPIView):
         )
 
 
-def calculate_attendance_summary(employees, start_date, end_date, user=None):
+def calculate_attendance_summary(employees, start_date, end_date, user=None, location=None):
     """
     Shared helper function to calculate attendance summary for all employees.
     Handles multiple check-ins/check-outs by pairing sequentially and summing durations.
@@ -2000,11 +2000,16 @@ def calculate_attendance_summary(employees, start_date, end_date, user=None):
         start_date: Start date in user's timezone
         end_date: End date in user's timezone
         user: User object to determine timezone (defaults to Asia/Kolkata)
+        location: Optional Location object to use location admin timezone (for superadmin)
     
     Returns: List of dictionaries with attendance summary data
     """
     summary = []
-    user_tz = get_user_timezone(user)
+    # If location is provided, use location admin timezone (for superadmin viewing specific location)
+    if location:
+        user_tz = get_timezone_from_location(location)
+    else:
+        user_tz = get_user_timezone(user)
     
     # Convert date range to UTC datetime range for filtering
     # Start of first day in user's timezone
@@ -2408,7 +2413,28 @@ class AttendanceSummaryView(AuthenticatedAPIView):
     def get(self, request):
         # Get today's date in user's timezone
         today = get_user_local_date(request.user, timezone.now())
-        logger.info(f"Attendance summary requested. User={request.user.email if request.user else None}, timezone={request.user.timezone if request.user and hasattr(request.user, 'timezone') else 'Asia/Kolkata'}, today={today}")
+        
+        # Get location_id parameter for superadmin
+        location_id = request.query_params.get('location_id')
+        selected_location = None
+        
+        # For superadmin, use location_id if provided to get location admin timezone
+        if request.user.role == User.Role.SUPERADMIN and location_id:
+            try:
+                selected_location = Location.objects.get(pk=location_id, is_deleted=False)
+            except Location.DoesNotExist:
+                pass
+        
+        # Determine timezone: use location admin timezone if location is selected, otherwise user timezone
+        if selected_location:
+            user_tz = get_timezone_from_location(selected_location)
+            today = timezone.now().astimezone(user_tz).date()
+        else:
+            user_tz = get_user_timezone(request.user)
+            today = get_user_local_date(request.user, timezone.now())
+        
+        logger.info(f"Attendance summary requested. User={request.user.email if request.user else None}, location_id={location_id}, timezone={user_tz.zone}, today={today}")
+        
         start_date = request.query_params.get('start_date', today.strftime('%Y-%m-%d'))
         end_date = request.query_params.get('end_date', today.strftime('%Y-%m-%d'))
         
@@ -2423,9 +2449,12 @@ class AttendanceSummaryView(AuthenticatedAPIView):
         employees = Employee.objects.select_related("location").prefetch_related("attendancelog_set")
         if request.user.role == User.Role.ADMIN:
             employees = employees.filter(location=request.user.location)
+        elif request.user.role == User.Role.SUPERADMIN and location_id:
+            employees = employees.filter(location_id=location_id)
 
-        # Use shared helper function with user timezone
-        summary = calculate_attendance_summary(employees, start_date, end_date, user=request.user)
+        # Use shared helper function with appropriate timezone
+        # For superadmin with location, pass location to get correct timezone
+        summary = calculate_attendance_summary(employees, start_date, end_date, user=request.user, location=selected_location)
         
         return Response(summary)
 
@@ -2434,7 +2463,27 @@ class AttendanceSummaryExportView(AuthenticatedAPIView):
     def get(self, request):
         # Get today's date in user's timezone
         today = get_user_local_date(request.user, timezone.now())
-        logger.info(f"Attendance export requested. User={request.user.email if request.user else None}, timezone={request.user.timezone if request.user and hasattr(request.user, 'timezone') else 'Asia/Kolkata'}, today={today}")
+        
+        # Get location_id parameter for superadmin
+        location_id = request.query_params.get('location_id')
+        selected_location = None
+        
+        # For superadmin, use location_id if provided to get location admin timezone
+        if request.user.role == User.Role.SUPERADMIN and location_id:
+            try:
+                selected_location = Location.objects.get(pk=location_id, is_deleted=False)
+            except Location.DoesNotExist:
+                pass
+        
+        # Determine timezone: use location admin timezone if location is selected, otherwise user timezone
+        if selected_location:
+            user_tz = get_timezone_from_location(selected_location)
+            today = timezone.now().astimezone(user_tz).date()
+        else:
+            user_tz = get_user_timezone(request.user)
+            today = get_user_local_date(request.user, timezone.now())
+        
+        logger.info(f"Attendance export requested. User={request.user.email if request.user else None}, location_id={location_id}, timezone={user_tz.zone}, today={today}")
         start_date = request.query_params.get('start_date', today.strftime('%Y-%m-%d'))
         end_date = request.query_params.get('end_date', today.strftime('%Y-%m-%d'))
         
@@ -2449,9 +2498,11 @@ class AttendanceSummaryExportView(AuthenticatedAPIView):
         employees = Employee.objects.select_related("location").prefetch_related("attendancelog_set")
         if request.user.role == User.Role.ADMIN:
             employees = employees.filter(location=request.user.location)
-        
-        # Use shared helper function with user timezone
-        summary = calculate_attendance_summary(employees, start_date, end_date, user=request.user)
+        elif request.user.role == User.Role.SUPERADMIN and location_id:
+            employees = employees.filter(location_id=location_id)
+
+        # Use shared helper function with appropriate timezone
+        summary = calculate_attendance_summary(employees, start_date, end_date, user=request.user, location=selected_location)
         
         # Convert to Excel
         wb = Workbook()
@@ -2607,8 +2658,23 @@ class MonthlyAttendanceStatusView(AuthenticatedAPIView):
                 {"error": "Invalid month format"}, status=status.HTTP_400_BAD_REQUEST
             )
 
+        # Get location_id parameter for superadmin
+        location_id = request.query_params.get('location_id')
+        selected_location = None
+        
+        # For superadmin, use location_id if provided to get location admin timezone
+        if request.user.role == User.Role.SUPERADMIN and location_id:
+            try:
+                selected_location = Location.objects.get(pk=location_id, is_deleted=False)
+            except Location.DoesNotExist:
+                pass
+
         # Convert date range to UTC for filtering
-        user_tz = get_user_timezone(request.user)
+        # Use location admin timezone if location is selected for superadmin
+        if selected_location:
+            user_tz = get_timezone_from_location(selected_location)
+        else:
+            user_tz = get_user_timezone(request.user)
         start_datetime_local = user_tz.localize(datetime.combine(start_date, datetime.min.time()))
         end_datetime_local = user_tz.localize(datetime.combine(end_date, datetime.max.time().replace(microsecond=999999)))
         start_datetime_utc = start_datetime_local.astimezone(pytz.UTC)
@@ -2621,6 +2687,8 @@ class MonthlyAttendanceStatusView(AuthenticatedAPIView):
         employees = Employee.objects.select_related("location").all()
         if request.user.role == User.Role.ADMIN:
             employees = employees.filter(location=request.user.location)
+        elif request.user.role == User.Role.SUPERADMIN and location_id:
+            employees = employees.filter(location_id=location_id)
 
         logs = AttendanceLog.objects.filter(
             timestamp__gte=start_datetime_utc,
@@ -2628,6 +2696,8 @@ class MonthlyAttendanceStatusView(AuthenticatedAPIView):
         )
         if request.user.role == User.Role.ADMIN:
             logs = logs.filter(employee__location=request.user.location)
+        elif request.user.role == User.Role.SUPERADMIN and location_id:
+            logs = logs.filter(employee__location_id=location_id)
 
         logs_by_key = defaultdict(list)
         for log in logs:
@@ -2669,10 +2739,18 @@ class MonthlyAttendanceStatusView(AuthenticatedAPIView):
                     except Exception:
                         worked_seconds = None
 
-                # Mark as Half-day Absent if worked < 4 hours
-                if worked_seconds is not None and worked_seconds < 4 * 3600:
-                    attendance_map[emp_id][log_date] = 'HA'
+                # Use same duration-based logic as Today's report (3h/6h thresholds)
+                if worked_seconds is None:
+                    # No valid duration calculation, mark as Absent
+                    attendance_map[emp_id][log_date] = 'A'
+                elif worked_seconds < 3 * 3600:
+                    # Worked less than 3 hours = Absent
+                    attendance_map[emp_id][log_date] = 'A'
+                elif worked_seconds < 6 * 3600:
+                    # Worked 3-6 hours = Half day Present
+                    attendance_map[emp_id][log_date] = 'HP'
                 else:
+                    # Worked 6+ hours = Present
                     attendance_map[emp_id][log_date] = 'P'
             else:
                 attendance_map[emp_id][log_date] = 'A'
@@ -2698,6 +2776,17 @@ class MonthlyAttendanceStatusExportView(AuthenticatedAPIView):
         if not month:
             return Response({"error": "Month is required in YYYY-MM format"}, status=400)
 
+        # Get location_id parameter for superadmin
+        location_id = request.query_params.get('location_id')
+        selected_location = None
+        
+        # For superadmin, use location_id if provided to get location admin timezone
+        if request.user.role == User.Role.SUPERADMIN and location_id:
+            try:
+                selected_location = Location.objects.get(pk=location_id, is_deleted=False)
+            except Location.DoesNotExist:
+                pass
+
         try:
             year, month_num = map(int, month.split("-"))
             start_date = datetime(year, month_num, 1).date()
@@ -2706,7 +2795,11 @@ class MonthlyAttendanceStatusExportView(AuthenticatedAPIView):
             return Response({"error": "Invalid month format"}, status=400)
 
         # Convert date range to UTC for filtering
-        user_tz = get_user_timezone(request.user)
+        # Use location admin timezone if location is selected for superadmin
+        if selected_location:
+            user_tz = get_timezone_from_location(selected_location)
+        else:
+            user_tz = get_user_timezone(request.user)
         start_datetime_local = user_tz.localize(datetime.combine(start_date, datetime.min.time()))
         end_datetime_local = user_tz.localize(datetime.combine(end_date, datetime.max.time().replace(microsecond=999999)))
         start_datetime_utc = start_datetime_local.astimezone(pytz.UTC)
@@ -2719,6 +2812,8 @@ class MonthlyAttendanceStatusExportView(AuthenticatedAPIView):
         employees = Employee.objects.select_related("location").all()
         if request.user.role == User.Role.ADMIN:
             employees = employees.filter(location=request.user.location)
+        elif request.user.role == User.Role.SUPERADMIN and location_id:
+            employees = employees.filter(location_id=location_id)
 
         logs = AttendanceLog.objects.filter(
             timestamp__gte=start_datetime_utc,
@@ -2726,8 +2821,11 @@ class MonthlyAttendanceStatusExportView(AuthenticatedAPIView):
         )
         if request.user.role == User.Role.ADMIN:
             logs = logs.filter(employee__location=request.user.location)
+        elif request.user.role == User.Role.SUPERADMIN and location_id:
+            logs = logs.filter(employee__location_id=location_id)
 
-        attendance_map = {}
+        # Use same logic as MonthlyAttendanceStatusView - group by employee and date
+        logs_by_key = defaultdict(list)
         for log in logs:
             # Convert UTC timestamp to user's timezone and get date
             if timezone.is_naive(log.timestamp):
@@ -2735,8 +2833,48 @@ class MonthlyAttendanceStatusExportView(AuthenticatedAPIView):
             else:
                 log_timestamp = log.timestamp
             log_date = log_timestamp.astimezone(user_tz).date()
-            key = (log.employee_id, log_date)
-            attendance_map[key] = "P"
+            logs_by_key[(log.employee_id, log_date)].append(log)
+
+        attendance_map = {}
+        for (emp_id, log_date), day_logs in logs_by_key.items():
+            # Determine presence if any checkin or checkout exists
+            types = {l.type for l in day_logs}
+            if 'checkin' in types or 'checkout' in types:
+                checkins = [l.timestamp for l in day_logs if l.type == 'checkin']
+                checkouts = [l.timestamp for l in day_logs if l.type == 'checkout']
+
+                # If there is a check-in but no checkout (or vice versa), mark Absent
+                if (checkins and not checkouts) or (checkouts and not checkins):
+                    attendance_map[(emp_id, log_date)] = 'A'
+                    continue
+
+                worked_seconds = None
+                if checkins and checkouts:
+                    # use earliest checkin and latest checkout
+                    try:
+                        start_ts = min(checkins)
+                        end_ts = max(checkouts)
+                        if timezone.is_naive(start_ts):
+                            start_ts = timezone.make_aware(start_ts, timezone.get_current_timezone())
+                        if timezone.is_naive(end_ts):
+                            end_ts = timezone.make_aware(end_ts, timezone.get_current_timezone())
+                        worked_seconds = (end_ts - start_ts).total_seconds()
+                    except Exception:
+                        worked_seconds = None
+
+                # Use same duration-based logic as Today's report (3h/6h thresholds)
+                if worked_seconds is None:
+                    # No valid duration calculation, mark as Absent
+                    attendance_map[(emp_id, log_date)] = 'A'
+                elif worked_seconds < 3 * 3600:
+                    # Worked less than 3 hours = Absent
+                    attendance_map[(emp_id, log_date)] = 'A'
+                elif worked_seconds < 6 * 3600:
+                    # Worked 3-6 hours = Half day Present
+                    attendance_map[(emp_id, log_date)] = 'HP'
+                else:
+                    # Worked 6+ hours = Present
+                    attendance_map[(emp_id, log_date)] = 'P'
 
         wb = Workbook()
         ws = wb.active
@@ -2762,6 +2900,10 @@ class MonthlyAttendanceStatusExportView(AuthenticatedAPIView):
                 row.append(status_code)
                 if status_code == "P":
                     present_count += 1
+                elif status_code == "HP":
+                    # Half day Present counts as 0.5 present and 0.5 absent
+                    present_count += 0.5
+                    absent_count += 0.5
                 elif status_code == "A":
                     absent_count += 1
 
