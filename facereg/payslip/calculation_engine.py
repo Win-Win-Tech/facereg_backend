@@ -1106,9 +1106,11 @@ def calculate_payslip_fields(employee, field_config, month):
     lop_was_calculated = False
     existing_lop_amount = Decimal('0')
     existing_lop_code = None
+    field_type_map = {f.field_code: f.field_type for f in fields}
+    
     for code, val in field_values.items():
         code_upper = code.upper()
-        if 'ABSENT' in code_upper or 'LOP' in code_upper or 'LOSS' in code_upper:
+        if ('ABSENT' in code_upper or 'LOP' in code_upper or 'LOSS' in code_upper) and field_type_map.get(code) == 'DEDUCTION':
             lop_was_calculated = True
             existing_lop_amount = Decimal(str(val))
             existing_lop_code = code
