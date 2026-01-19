@@ -1569,17 +1569,33 @@ class FaceAttendanceView(APIView):
         if shift:
             in_base, in_grace, status_hint = self.in_shift_window(now, shift)
 
-            tz = timezone.get_current_timezone()
-            now_local = timezone.localtime(now) if not timezone.is_naive(now) else timezone.make_aware(now, tz)
+            # Use the same timezone (user_tz) that was calculated earlier for consistency
+            # This ensures shift timing validation uses the correct timezone (user's or location admin's)
+            tz = user_tz  # Use user/location timezone, not Django's default
+            # now_local was already calculated above using user_tz, so use it directly
+            # now_local = now.astimezone(user_tz) - already calculated at line 1374
             start_time = shift.start_time
             end_time = shift.end_time
+            
+            # Handle overnight shifts correctly (e.g., 22:00 - 06:00)
+            # If end_time <= start_time, it's an overnight shift
             if end_time > start_time:
+                # Normal day shift (e.g., 09:00 - 18:00)
                 start_dt_naive = datetime.combine(now_local.date(), start_time)
                 end_dt_naive = datetime.combine(now_local.date(), end_time)
             else:
-               
-                start_dt_naive = datetime.combine(now_local.date(), start_time)
-                end_dt_naive = datetime.combine(now_local.date() + timedelta(days=1), end_time)
+                # Overnight shift (e.g., 22:00 - 06:00)
+                # If current time is >= start_time, shift started today and ends tomorrow
+                # If current time is < start_time, shift started yesterday and ends today
+                if now_local.time() >= start_time:
+                    # We're in the first part of the shift (e.g., 23:00 on Jan 15)
+                    start_dt_naive = datetime.combine(now_local.date(), start_time)
+                    end_dt_naive = datetime.combine(now_local.date() + timedelta(days=1), end_time)
+                else:
+                    # We're in the second part of the shift (e.g., 02:00 on Jan 16, shift started Jan 15 22:00)
+                    start_dt_naive = datetime.combine(now_local.date() - timedelta(days=1), start_time)
+                    end_dt_naive = datetime.combine(now_local.date(), end_time)
+            
             start_dt = timezone.make_aware(start_dt_naive, tz)
             end_dt = timezone.make_aware(end_dt_naive, tz)
 
@@ -1990,10 +2006,107 @@ class RegisterEmployeeView(AuthenticatedAPIView):
         )
 
 
+def _pair_overnight_checkins_checkouts(checkin_logs, checkout_logs, user_tz):
+    """
+    Helper function to pair checkins and checkouts that may span midnight (overnight shifts).
+    Handles both normal shifts and consecutive overnight shifts correctly.
+    
+    For overnight shifts (e.g., 22:00 - 06:00):
+    - Checkin on Jan 15 23:00 should pair with checkout on Jan 16 05:00
+    - Checkout on Jan 16 05:00 should pair with checkin on Jan 15 23:00
+    
+    For consecutive overnight shifts:
+    - Jan 15 22:00 checkin pairs with Jan 16 06:00 checkout
+    - Jan 16 22:00 checkin pairs with Jan 17 06:00 checkout
+    - Each checkout is only paired once (handled by used_checkouts set)
+    
+    Args:
+        checkin_logs: List of checkin AttendanceLog objects (sorted by timestamp)
+        checkout_logs: List of checkout AttendanceLog objects (sorted by timestamp)
+        user_tz: pytz timezone object
+    
+    Returns:
+        List of tuples: [(checkin_log, checkout_log), ...] for valid pairs
+    """
+    pairs = []
+    used_checkins = set()
+    used_checkouts = set()
+    
+    # Convert timestamps to timezone-aware if needed
+    def get_local_date(log):
+        ts = log.timestamp
+        if timezone.is_naive(ts):
+            ts = timezone.make_aware(ts, pytz.UTC)
+        return ts.astimezone(user_tz).date()
+    
+    def get_local_datetime(log):
+        ts = log.timestamp
+        if timezone.is_naive(ts):
+            ts = timezone.make_aware(ts, pytz.UTC)
+        return ts.astimezone(user_tz)
+    
+    # Process checkins in chronological order to handle consecutive shifts correctly
+    for checkin in checkin_logs:
+        if checkin.id in used_checkins:
+            continue
+        checkin_date = get_local_date(checkin)
+        checkin_dt = get_local_datetime(checkin)
+        
+        # Find best matching checkout
+        # Priority: 1) Same date, 2) Next date (overnight shift), 3) Minimum time difference
+        best_checkout = None
+        best_checkout_idx = None
+        best_score = None  # Lower score is better (prefer same date, then shorter duration)
+        
+        for idx, checkout in enumerate(checkout_logs):
+            if checkout.id in used_checkouts:
+                continue
+            checkout_date = get_local_date(checkout)
+            checkout_dt = get_local_datetime(checkout)
+            
+            # Checkout must be after checkin
+            if checkout_dt <= checkin_dt:
+                continue
+            
+            # Calculate time difference
+            time_diff = (checkout_dt - checkin_dt).total_seconds()
+            
+            # For overnight shifts, allow up to 30 hours (to handle late checkouts)
+            # Normal shifts should be within 24 hours, but allow buffer for edge cases
+            if time_diff > 30 * 3600:  # More than 30 hours, skip (likely wrong pairing)
+                continue
+            
+            # Prefer checkout on same date (normal shift), but allow next day (overnight shift)
+            # Score: 0 = same date, 1 = next date, + time difference in hours for tie-breaking
+            if checkout_date == checkin_date:
+                # Same date (normal shift) - prefer this
+                score = 0 + (time_diff / 3600.0)  # Add hours as tie-breaker
+            elif checkout_date == checkin_date + timedelta(days=1):
+                # Next date (overnight shift) - acceptable
+                score = 1 + (time_diff / 3600.0)  # Add hours as tie-breaker
+            else:
+                # More than 1 day apart - skip (likely wrong pairing)
+                continue
+            
+            # Select checkout with best score (lower is better)
+            if best_score is None or score < best_score:
+                best_score = score
+                best_checkout = checkout
+                best_checkout_idx = idx
+        
+        if best_checkout:
+            pairs.append((checkin, best_checkout))
+            used_checkins.add(checkin.id)
+            used_checkouts.add(best_checkout.id)
+    
+    return pairs
+
+
 def calculate_attendance_summary(employees, start_date, end_date, user=None, location=None):
     """
     Shared helper function to calculate attendance summary for all employees.
     Handles multiple check-ins/check-outs by pairing sequentially and summing durations.
+    Correctly handles overnight shifts where checkin and checkout span midnight.
     
     Args:
         employees: QuerySet of employees
@@ -2077,13 +2190,52 @@ def calculate_attendance_summary(employees, start_date, end_date, user=None, loc
             shift = assignment.shift if assignment else None
             date_logs = logs_by_date.get(log_date, [])
             
-            # Separate checkins and checkouts, sorted by timestamp
-            checkin_logs = sorted([log for log in date_logs if log.type == 'checkin'], key=lambda x: x.timestamp)
-            checkout_logs = sorted([log for log in date_logs if log.type == 'checkout'], key=lambda x: x.timestamp)
+            # For overnight shifts, we need to check logs from previous day AND next day
+            # This handles consecutive overnight shifts correctly:
+            # - Jan 15 22:00 checkin needs Jan 16 06:00 checkout (from next day)
+            # - Jan 16 22:00 checkin needs Jan 17 06:00 checkout (from next day)
+            prev_date = log_date - timedelta(days=1)
+            next_date = log_date + timedelta(days=1)
+            prev_date_logs = logs_by_date.get(prev_date, [])
+            next_date_logs = logs_by_date.get(next_date, [])
             
-            # Get earliest checkin and latest checkout for display
-            earliest_checkin_log = checkin_logs[0] if checkin_logs else None
-            latest_checkout_log = checkout_logs[-1] if checkout_logs else None
+            # Combine logs from previous, current, and next date for pairing
+            # This ensures we can pair overnight shifts that span multiple days
+            all_relevant_logs = prev_date_logs + date_logs + next_date_logs
+            
+            # Separate checkins and checkouts, sorted by timestamp
+            checkin_logs = sorted([log for log in all_relevant_logs if log.type == 'checkin'], key=lambda x: x.timestamp)
+            checkout_logs = sorted([log for log in all_relevant_logs if log.type == 'checkout'], key=lambda x: x.timestamp)
+            
+            # Use helper function to pair checkins and checkouts (handles overnight shifts)
+            valid_pairs = _pair_overnight_checkins_checkouts(checkin_logs, checkout_logs, user_tz)
+            
+            # Filter pairs where checkin is on current date (for overnight shifts, checkin date is the shift date)
+            pairs_for_this_date = []
+            for checkin_log, checkout_log in valid_pairs:
+                # Convert checkin timestamp to local timezone to get date
+                checkin_ts = checkin_log.timestamp
+                if timezone.is_naive(checkin_ts):
+                    checkin_ts = timezone.make_aware(checkin_ts, pytz.UTC)
+                checkin_date_local = checkin_ts.astimezone(user_tz).date()
+                
+                # Include pair if checkin is on current date (this is the shift start date)
+                if checkin_date_local == log_date:
+                    pairs_for_this_date.append((checkin_log, checkout_log))
+            
+            # Get unpaired checkins and checkouts for this date
+            paired_checkin_ids = {log.id for pair in pairs_for_this_date for log in [pair[0]]}
+            paired_checkout_ids = {log.id for pair in pairs_for_this_date for log in [pair[1]]}
+            
+            unpaired_checkins = [log for log in date_logs if log.type == 'checkin' and log.id not in paired_checkin_ids]
+            unpaired_checkouts = [log for log in date_logs if log.type == 'checkout' and log.id not in paired_checkout_ids]
+            
+            # Get earliest checkin and latest checkout for display (from pairs or unpaired)
+            all_checkins_for_date = [pair[0] for pair in pairs_for_this_date] + unpaired_checkins
+            all_checkouts_for_date = [pair[1] for pair in pairs_for_this_date] + unpaired_checkouts
+            
+            earliest_checkin_log = min(all_checkins_for_date, key=lambda x: x.timestamp) if all_checkins_for_date else None
+            latest_checkout_log = max(all_checkouts_for_date, key=lambda x: x.timestamp) if all_checkouts_for_date else None
             
             # For display purposes (return in response) - Convert UTC timestamps to user's timezone
             checkin_time = None
@@ -2099,25 +2251,21 @@ def calculate_attendance_summary(employees, start_date, end_date, user=None, loc
                     checkout_ts_utc = timezone.make_aware(checkout_ts_utc, pytz.UTC)
                 checkout_time = checkout_ts_utc.astimezone(user_tz)
             
-            # Track multiple entries info
-            checkin_count = len(checkin_logs)
-            checkout_count = len(checkout_logs)
-            has_multiple_entries = (checkin_count > 1) or (checkout_count > 1)
+            # Track multiple entries info (count from date_logs only, not including prev_date)
+            checkin_count = len([log for log in date_logs if log.type == 'checkin'])
+            checkout_count = len([log for log in date_logs if log.type == 'checkout'])
+            # Also count pairs that started on this date (for overnight shifts)
+            total_checkins = len([pair[0] for pair in pairs_for_this_date]) + len(unpaired_checkins)
+            total_checkouts = len([pair[1] for pair in pairs_for_this_date]) + len(unpaired_checkouts)
+            has_multiple_entries = (total_checkins > 1) or (total_checkouts > 1)
             
-            # Calculate total duration by pairing checkins with checkouts sequentially
+            # Calculate total duration using the paired logs (handles overnight shifts correctly)
             total_worked_seconds = 0
-            paired_count = 0
+            paired_count = len(pairs_for_this_date)
             pair_details = []  # Store details of each valid pair
             
-            # Pair checkins with checkouts sequentially
-            min_pairs = min(len(checkin_logs), len(checkout_logs))
-            
-            for i in range(min_pairs):
-                checkin_log = checkin_logs[i]
-                checkout_log = checkout_logs[i]
-                
-                # Ensure checkout comes after checkin (valid pair)
-                if checkout_log.timestamp > checkin_log.timestamp:
+            # Process pairs for this date (including overnight shifts)
+            for pair_num, (checkin_log, checkout_log) in enumerate(pairs_for_this_date, 1):
                     # Make timezone-aware (timestamps are stored in UTC)
                     checkin_ts = checkin_log.timestamp
                     checkout_ts = checkout_log.timestamp
@@ -2133,22 +2281,15 @@ def calculate_attendance_summary(employees, start_date, end_date, user=None, loc
                     # Only add positive durations (safety check)
                     if pair_duration > 0:
                         total_worked_seconds += pair_duration
-                        paired_count += 1
                         
                         # Store pair details for frontend - Convert UTC timestamps to user's timezone
                         hours = int(pair_duration // 3600)
                         minutes = int((pair_duration % 3600) // 60)
                         # Convert timestamps to user's timezone for display
-                        checkin_ts_utc = checkin_log.timestamp
-                        checkout_ts_utc = checkout_log.timestamp
-                        if timezone.is_naive(checkin_ts_utc):
-                            checkin_ts_utc = timezone.make_aware(checkin_ts_utc, pytz.UTC)
-                        if timezone.is_naive(checkout_ts_utc):
-                            checkout_ts_utc = timezone.make_aware(checkout_ts_utc, pytz.UTC)
-                        checkin_ts_local = checkin_ts_utc.astimezone(user_tz)
-                        checkout_ts_local = checkout_ts_utc.astimezone(user_tz)
+                        checkin_ts_local = checkin_ts.astimezone(user_tz)
+                        checkout_ts_local = checkout_ts.astimezone(user_tz)
                         pair_details.append({
-                            "pair_number": paired_count,
+                            "pair_number": pair_num,
                             "checkin": checkin_ts_local.strftime("%Y-%m-%d %H:%M:%S"),
                             "checkout": checkout_ts_local.strftime("%Y-%m-%d %H:%M:%S"),
                             "duration": f"{hours:02d}:{minutes:02d}",
@@ -2500,7 +2641,7 @@ class AttendanceSummaryExportView(AuthenticatedAPIView):
             employees = employees.filter(location=request.user.location)
         elif request.user.role == User.Role.SUPERADMIN and location_id:
             employees = employees.filter(location_id=location_id)
-
+        
         # Use shared helper function with appropriate timezone
         summary = calculate_attendance_summary(employees, start_date, end_date, user=request.user, location=selected_location)
         
@@ -2690,70 +2831,109 @@ class MonthlyAttendanceStatusView(AuthenticatedAPIView):
         elif request.user.role == User.Role.SUPERADMIN and location_id:
             employees = employees.filter(location_id=location_id)
 
+        # Extend date range to include previous and next day for overnight shift handling
+        # This ensures overnight shifts at month boundaries are captured correctly
+        extended_start_date = start_date - timedelta(days=1)
+        extended_end_date = end_date + timedelta(days=1)
+        extended_start_datetime_local = user_tz.localize(datetime.combine(extended_start_date, datetime.min.time()))
+        extended_end_datetime_local = user_tz.localize(datetime.combine(extended_end_date, datetime.max.time().replace(microsecond=999999)))
+        extended_start_datetime_utc = extended_start_datetime_local.astimezone(pytz.UTC)
+        extended_end_datetime_utc = extended_end_datetime_local.astimezone(pytz.UTC)
+        
         logs = AttendanceLog.objects.filter(
-            timestamp__gte=start_datetime_utc,
-            timestamp__lte=end_datetime_utc
+            timestamp__gte=extended_start_datetime_utc,
+            timestamp__lte=extended_end_datetime_utc
         )
         if request.user.role == User.Role.ADMIN:
             logs = logs.filter(employee__location=request.user.location)
         elif request.user.role == User.Role.SUPERADMIN and location_id:
             logs = logs.filter(employee__location_id=location_id)
 
-        logs_by_key = defaultdict(list)
+        # Group logs by employee first, then pair checkins/checkouts (handles overnight shifts)
+        logs_by_employee = defaultdict(list)
         for log in logs:
             try:
-                # Convert UTC timestamp to user's timezone and get date
+                # Convert UTC timestamp to user's timezone
                 if timezone.is_naive(log.timestamp):
                     log_timestamp = timezone.make_aware(log.timestamp, pytz.UTC)
                 else:
                     log_timestamp = log.timestamp
-                log_date = log_timestamp.astimezone(user_tz).date()
             except Exception:
                 continue
-            logs_by_key[(log.employee_id, log_date)].append(log)
+            logs_by_employee[log.employee_id].append(log)
 
         attendance_map = defaultdict(dict)
-        for (emp_id, log_date), day_logs in logs_by_key.items():
-            # Determine presence if any checkin or checkout exists
-            types = {l.type for l in day_logs}
-            if 'checkin' in types or 'checkout' in types:
-                checkins = [l.timestamp for l in day_logs if l.type == 'checkin']
-                checkouts = [l.timestamp for l in day_logs if l.type == 'checkout']
-
-                # If there is a check-in but no checkout (or vice versa), mark Absent
-                if (checkins and not checkouts) or (checkouts and not checkins):
-                    attendance_map[emp_id][log_date] = 'A'
+        
+        # Process each employee's logs
+        for emp_id, emp_logs in logs_by_employee.items():
+            # Separate checkins and checkouts
+            checkin_logs = sorted([log for log in emp_logs if log.type == 'checkin'], key=lambda x: x.timestamp)
+            checkout_logs = sorted([log for log in emp_logs if log.type == 'checkout'], key=lambda x: x.timestamp)
+            
+            # Use helper function to pair checkins and checkouts (handles overnight shifts)
+            valid_pairs = _pair_overnight_checkins_checkouts(checkin_logs, checkout_logs, user_tz)
+            
+            # Group pairs by checkin date (shift start date for overnight shifts)
+            pairs_by_date = defaultdict(list)
+            for checkin_log, checkout_log in valid_pairs:
+                # Get checkin date in user's timezone (this is the shift date)
+                checkin_ts = checkin_log.timestamp
+                if timezone.is_naive(checkin_ts):
+                    checkin_ts = timezone.make_aware(checkin_ts, pytz.UTC)
+                checkin_date = checkin_ts.astimezone(user_tz).date()
+                pairs_by_date[checkin_date].append((checkin_log, checkout_log))
+            
+            # Process pairs for each date (only include dates within the month range)
+            for checkin_date, pairs in pairs_by_date.items():
+                # Only process pairs where checkin date is within the requested month range
+                if checkin_date < start_date or checkin_date > end_date:
                     continue
-
-                worked_seconds = None
-                if checkins and checkouts:
-                    # use earliest checkin and latest checkout
-                    try:
-                        start_ts = min(checkins)
-                        end_ts = max(checkouts)
-                        if timezone.is_naive(start_ts):
-                            start_ts = timezone.make_aware(start_ts, timezone.get_current_timezone())
-                        if timezone.is_naive(end_ts):
-                            end_ts = timezone.make_aware(end_ts, timezone.get_current_timezone())
-                        worked_seconds = (end_ts - start_ts).total_seconds()
-                    except Exception:
-                        worked_seconds = None
-
+                
+                # Calculate total worked seconds for all pairs on this date
+                total_worked_seconds = 0
+                for checkin_log, checkout_log in pairs:
+                    checkin_ts = checkin_log.timestamp
+                    checkout_ts = checkout_log.timestamp
+                    if timezone.is_naive(checkin_ts):
+                        checkin_ts = timezone.make_aware(checkin_ts, pytz.UTC)
+                    if timezone.is_naive(checkout_ts):
+                        checkout_ts = timezone.make_aware(checkout_ts, pytz.UTC)
+                    pair_duration = (checkout_ts - checkin_ts).total_seconds()
+                    if pair_duration > 0:
+                        total_worked_seconds += pair_duration
+                
                 # Use same duration-based logic as Today's report (3h/6h thresholds)
-                if worked_seconds is None:
-                    # No valid duration calculation, mark as Absent
-                    attendance_map[emp_id][log_date] = 'A'
-                elif worked_seconds < 3 * 3600:
+                if total_worked_seconds < 3 * 3600:
                     # Worked less than 3 hours = Absent
-                    attendance_map[emp_id][log_date] = 'A'
-                elif worked_seconds < 6 * 3600:
+                    attendance_map[emp_id][checkin_date] = 'A'
+                elif total_worked_seconds < 6 * 3600:
                     # Worked 3-6 hours = Half day Present
-                    attendance_map[emp_id][log_date] = 'HP'
+                    attendance_map[emp_id][checkin_date] = 'HP'
                 else:
                     # Worked 6+ hours = Present
-                    attendance_map[emp_id][log_date] = 'P'
-            else:
-                attendance_map[emp_id][log_date] = 'A'
+                    attendance_map[emp_id][checkin_date] = 'P'
+            
+            # Handle unpaired checkins/checkouts (mark as Absent)
+            # Only process logs within the month range
+            paired_checkin_ids = {log.id for pairs in pairs_by_date.values() for log, _ in pairs}
+            paired_checkout_ids = {log.id for pairs in pairs_by_date.values() for _, log in pairs}
+            
+            for log in emp_logs:
+                if log.id in paired_checkin_ids or log.id in paired_checkout_ids:
+                    continue
+                
+                log_ts = log.timestamp
+                if timezone.is_naive(log_ts):
+                    log_ts = timezone.make_aware(log_ts, pytz.UTC)
+                log_date = log_ts.astimezone(user_tz).date()
+                
+                # Only process logs within the month range
+                if log_date < start_date or log_date > end_date:
+                    continue
+                
+                # Unpaired checkin or checkout = Absent
+                if log_date not in attendance_map[emp_id]:
+                    attendance_map[emp_id][log_date] = 'A'
 
         summary = []
         for emp in employees:
@@ -2762,8 +2942,10 @@ class MonthlyAttendanceStatusView(AuthenticatedAPIView):
                 if emp.id in attendance_map and day in attendance_map[emp.id]:
                     status_code = attendance_map[emp.id][day]
                 else:
-                    has_any = any(k[0] == emp.id for k in logs_by_key.keys())
-                    status_code = "A" if has_any else "-"
+                    # Check if employee has any attendance records in this month
+                    # If yes, missing days are Absent. If no, show "-" (no data)
+                    has_any_records = (emp.id in attendance_map and len(attendance_map[emp.id]) > 0) or emp.id in logs_by_employee
+                    status_code = "A" if has_any_records else "-"
                 row[day.strftime("%d-%b")] = status_code
             summary.append(row)
 
@@ -2815,66 +2997,108 @@ class MonthlyAttendanceStatusExportView(AuthenticatedAPIView):
         elif request.user.role == User.Role.SUPERADMIN and location_id:
             employees = employees.filter(location_id=location_id)
 
+        # Extend date range to include previous and next day for overnight shift handling
+        # This ensures overnight shifts at month boundaries are captured correctly
+        extended_start_date = start_date - timedelta(days=1)
+        extended_end_date = end_date + timedelta(days=1)
+        extended_start_datetime_local = user_tz.localize(datetime.combine(extended_start_date, datetime.min.time()))
+        extended_end_datetime_local = user_tz.localize(datetime.combine(extended_end_date, datetime.max.time().replace(microsecond=999999)))
+        extended_start_datetime_utc = extended_start_datetime_local.astimezone(pytz.UTC)
+        extended_end_datetime_utc = extended_end_datetime_local.astimezone(pytz.UTC)
+        
         logs = AttendanceLog.objects.filter(
-            timestamp__gte=start_datetime_utc,
-            timestamp__lte=end_datetime_utc
+            timestamp__gte=extended_start_datetime_utc,
+            timestamp__lte=extended_end_datetime_utc
         )
         if request.user.role == User.Role.ADMIN:
             logs = logs.filter(employee__location=request.user.location)
         elif request.user.role == User.Role.SUPERADMIN and location_id:
             logs = logs.filter(employee__location_id=location_id)
 
-        # Use same logic as MonthlyAttendanceStatusView - group by employee and date
-        logs_by_key = defaultdict(list)
+        # Use same logic as MonthlyAttendanceStatusView - group by employee, then pair checkins/checkouts
+        logs_by_employee = defaultdict(list)
         for log in logs:
-            # Convert UTC timestamp to user's timezone and get date
-            if timezone.is_naive(log.timestamp):
-                log_timestamp = timezone.make_aware(log.timestamp, pytz.UTC)
-            else:
-                log_timestamp = log.timestamp
-            log_date = log_timestamp.astimezone(user_tz).date()
-            logs_by_key[(log.employee_id, log_date)].append(log)
+            try:
+                # Convert UTC timestamp to user's timezone
+                if timezone.is_naive(log.timestamp):
+                    log_timestamp = timezone.make_aware(log.timestamp, pytz.UTC)
+                else:
+                    log_timestamp = log.timestamp
+            except Exception:
+                continue
+            logs_by_employee[log.employee_id].append(log)
 
         attendance_map = {}
-        for (emp_id, log_date), day_logs in logs_by_key.items():
-            # Determine presence if any checkin or checkout exists
-            types = {l.type for l in day_logs}
-            if 'checkin' in types or 'checkout' in types:
-                checkins = [l.timestamp for l in day_logs if l.type == 'checkin']
-                checkouts = [l.timestamp for l in day_logs if l.type == 'checkout']
-
-                # If there is a check-in but no checkout (or vice versa), mark Absent
-                if (checkins and not checkouts) or (checkouts and not checkins):
-                    attendance_map[(emp_id, log_date)] = 'A'
+        
+        # Process each employee's logs
+        for emp_id, emp_logs in logs_by_employee.items():
+            # Separate checkins and checkouts
+            checkin_logs = sorted([log for log in emp_logs if log.type == 'checkin'], key=lambda x: x.timestamp)
+            checkout_logs = sorted([log for log in emp_logs if log.type == 'checkout'], key=lambda x: x.timestamp)
+            
+            # Use helper function to pair checkins and checkouts (handles overnight shifts)
+            valid_pairs = _pair_overnight_checkins_checkouts(checkin_logs, checkout_logs, user_tz)
+            
+            # Group pairs by checkin date (shift start date for overnight shifts)
+            pairs_by_date = defaultdict(list)
+            for checkin_log, checkout_log in valid_pairs:
+                # Get checkin date in user's timezone (this is the shift date)
+                checkin_ts = checkin_log.timestamp
+                if timezone.is_naive(checkin_ts):
+                    checkin_ts = timezone.make_aware(checkin_ts, pytz.UTC)
+                checkin_date = checkin_ts.astimezone(user_tz).date()
+                pairs_by_date[checkin_date].append((checkin_log, checkout_log))
+            
+            # Process pairs for each date (only include dates within the month range)
+            for checkin_date, pairs in pairs_by_date.items():
+                # Only process pairs where checkin date is within the requested month range
+                if checkin_date < start_date or checkin_date > end_date:
                     continue
-
-                worked_seconds = None
-                if checkins and checkouts:
-                    # use earliest checkin and latest checkout
-                    try:
-                        start_ts = min(checkins)
-                        end_ts = max(checkouts)
-                        if timezone.is_naive(start_ts):
-                            start_ts = timezone.make_aware(start_ts, timezone.get_current_timezone())
-                        if timezone.is_naive(end_ts):
-                            end_ts = timezone.make_aware(end_ts, timezone.get_current_timezone())
-                        worked_seconds = (end_ts - start_ts).total_seconds()
-                    except Exception:
-                        worked_seconds = None
-
+                
+                # Calculate total worked seconds for all pairs on this date
+                total_worked_seconds = 0
+                for checkin_log, checkout_log in pairs:
+                    checkin_ts = checkin_log.timestamp
+                    checkout_ts = checkout_log.timestamp
+                    if timezone.is_naive(checkin_ts):
+                        checkin_ts = timezone.make_aware(checkin_ts, pytz.UTC)
+                    if timezone.is_naive(checkout_ts):
+                        checkout_ts = timezone.make_aware(checkout_ts, pytz.UTC)
+                    pair_duration = (checkout_ts - checkin_ts).total_seconds()
+                    if pair_duration > 0:
+                        total_worked_seconds += pair_duration
+                
                 # Use same duration-based logic as Today's report (3h/6h thresholds)
-                if worked_seconds is None:
-                    # No valid duration calculation, mark as Absent
-                    attendance_map[(emp_id, log_date)] = 'A'
-                elif worked_seconds < 3 * 3600:
+                if total_worked_seconds < 3 * 3600:
                     # Worked less than 3 hours = Absent
-                    attendance_map[(emp_id, log_date)] = 'A'
-                elif worked_seconds < 6 * 3600:
+                    attendance_map[(emp_id, checkin_date)] = 'A'
+                elif total_worked_seconds < 6 * 3600:
                     # Worked 3-6 hours = Half day Present
-                    attendance_map[(emp_id, log_date)] = 'HP'
+                    attendance_map[(emp_id, checkin_date)] = 'HP'
                 else:
                     # Worked 6+ hours = Present
-                    attendance_map[(emp_id, log_date)] = 'P'
+                    attendance_map[(emp_id, checkin_date)] = 'P'
+            
+            # Handle unpaired checkins/checkouts (mark as Absent)
+            paired_checkin_ids = {log.id for pairs in pairs_by_date.values() for log, _ in pairs}
+            paired_checkout_ids = {log.id for pairs in pairs_by_date.values() for _, log in pairs}
+            
+            for log in emp_logs:
+                if log.id in paired_checkin_ids or log.id in paired_checkout_ids:
+                    continue
+                
+                log_ts = log.timestamp
+                if timezone.is_naive(log_ts):
+                    log_ts = timezone.make_aware(log_ts, pytz.UTC)
+                log_date = log_ts.astimezone(user_tz).date()
+                
+                # Only process logs within the month range
+                if log_date < start_date or log_date > end_date:
+                    continue
+                
+                # Unpaired checkin or checkout = Absent
+                if (emp_id, log_date) not in attendance_map:
+                    attendance_map[(emp_id, log_date)] = 'A'
 
         wb = Workbook()
         ws = wb.active
@@ -2915,7 +3139,8 @@ class MonthlyAttendanceStatusExportView(AuthenticatedAPIView):
         filepath = os.path.join(settings.MEDIA_ROOT, filename)
         wb.save(filepath)
 
-        file_url = request.build_absolute_uri(settings.MEDIA_URL + filename)
+        file_url = request.build_absolute_uri(settings.MEDIA_URL + filename).replace("http://", "https://")
+        logger.info(f"Monthly export file URL: {file_url}")
         return Response({"file_url": file_url})
 
 

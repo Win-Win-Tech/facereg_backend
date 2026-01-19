@@ -67,8 +67,8 @@ def get_default_salary_config_template():
                 'field_name': 'Transport Allowance',
                 'field_code': 'TRANSPORT',
                 'field_type': 'EARNING',
-                'value_type': 'FIXED',
-                'value': '2000',  # Fixed amount
+                'value_type': 'PERCENTAGE',
+                'value': '10',  # 10% of gross salary
                 'display_order': 3,
                 'is_visible': True,
             },
@@ -76,8 +76,8 @@ def get_default_salary_config_template():
                 'field_name': 'Medical Allowance',
                 'field_code': 'MEDICAL',
                 'field_type': 'EARNING',
-                'value_type': 'FIXED',
-                'value': '1500',  # Fixed amount
+                'value_type': 'PERCENTAGE',
+                'value': '10',  # 10% of gross salary
                 'display_order': 4,
                 'is_visible': True,
             },
@@ -86,8 +86,8 @@ def get_default_salary_config_template():
                 'field_name': 'Provident Fund',
                 'field_code': 'PF',
                 'field_type': 'DEDUCTION',
-                'value_type': 'PERCENTAGE',
-                'value': '12',  # 12% of basic salary
+                'value_type': 'CALCULATION',
+                'value': 'BASIC * 0.12',  # 12% of Basic Salary (calculated after BASIC is computed)
                 'display_order': 5,
                 'is_visible': True,
             },
@@ -1074,8 +1074,19 @@ class PayslipGenerateView(AuthenticatedAPIView):
             total_deductions = result['total_deductions']
             attendance = result['attendance']
             
-            gross_salary = employee.gross_salary or employee.base_salary or Decimal('0')
+            # Use gross_salary from calculation result (sum of earnings) or fallback to employee's gross
+            gross_salary = result.get('gross_salary', employee.gross_salary or employee.base_salary or Decimal('0'))
+            
+            # Net Pay = Total Earnings - Total Deductions
+            # In standard payslip format:
+            # - Earnings show full amounts
+            # - Deductions include LOP (for absent days), PF, ESI, etc.
+            # - Net Pay = Gross Salary - All Deductions
             net_pay = total_earnings - total_deductions
+            
+            # Ensure net_pay is not negative (set to 0 if negative)
+            if net_pay < 0:
+                net_pay = Decimal('0')
             
             record = PayslipRecord.objects.create(
                 employee=employee,
@@ -1221,8 +1232,15 @@ class PayslipBulkGenerateView(AuthenticatedAPIView):
                 total_deductions = result['total_deductions']
                 attendance = result['attendance']
                 
-                gross_salary = employee.gross_salary or employee.base_salary or Decimal('0')
+                # Use gross_salary from calculation result (sum of earnings) or fallback to employee's gross
+                gross_salary = result.get('gross_salary', employee.gross_salary or employee.base_salary or Decimal('0'))
+                
+                # Net Pay = Total Earnings - Total Deductions
                 net_pay = total_earnings - total_deductions
+                
+                # Ensure net_pay is not negative (set to 0 if negative)
+                if net_pay < 0:
+                    net_pay = Decimal('0')
                 
                 record = PayslipRecord.objects.create(
                     employee=employee,
