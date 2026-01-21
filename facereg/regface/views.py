@@ -1331,6 +1331,14 @@ class UserSiteDetailView(AuthenticatedAPIView):
 #         return in_base, in_grace, status_hint
 
 
+def get_location_admin(employee):
+    return User.objects.filter(
+        location_id=employee.location_id,
+        role=User.Role.ADMIN,
+        is_active=True,
+        is_deleted=False
+    ).first()
+
 class FaceAttendanceView(APIView):
     permission_classes = [permissions.AllowAny]
 
@@ -1359,7 +1367,9 @@ class FaceAttendanceView(APIView):
             return Response({"error": "Matched employee not found in DB"}, status=status.HTTP_404_NOT_FOUND)
 
         # Admin check: Ensure matched employee belongs to the admin's location
-        user = getattr(request, "user", None)
+        # user = getattr(request, "user", None)
+        user =get_location_admin(matched_employee)
+
         if isinstance(user, User) and user.role == User.Role.ADMIN:
             if matched_employee.location != user.location:
                  return Response({"error": "Face not recognized (Location mismatch)"}, status=status.HTTP_404_NOT_FOUND)
