@@ -1367,8 +1367,8 @@ class FaceAttendanceView(APIView):
             return Response({"error": "Matched employee not found in DB"}, status=status.HTTP_404_NOT_FOUND)
 
         # Admin check: Ensure matched employee belongs to the admin's location
-        # user = getattr(request, "user", None)
-        user =get_location_admin(matched_employee)
+        user = getattr(request, "user", None)
+        # user =get_location_admin(matched_employee)
 
         if isinstance(user, User) and user.role == User.Role.ADMIN:
             if matched_employee.location != user.location:
@@ -1465,12 +1465,11 @@ class FaceAttendanceView(APIView):
                     },
                     status=status.HTTP_403_FORBIDDEN,
                 )
-            # ✅ PRIORITY: Use employee's ASSIGNED shift from Assignment table
-            # The shift must also be available in the site's M2M (regface_site_shifts) assignments
-            logger.info(f"DEBUG: Finding shifts for nearest_site: {nearest_site.id}")
+            # ✅ PRIORITY 1: Use employee's ASSIGNED shift from Assignment table
+            # If present, we use it regardless of site M2M assignments
+            logger.info(f"DEBUG: Finding shifts for employee: {matched_employee.id}")
             try:
-                # Step 1: Get employee's shift assignment (location-based assignment)
-                # This is the SPECIFIC shift they should use
+                # Step 1: Get employee's shift assignment
                 assignment = Assignment.objects.filter(
                     user_id=matched_employee.id,
                     location_id=matched_employee.location_id,
@@ -1478,29 +1477,28 @@ class FaceAttendanceView(APIView):
                 ).order_by('-assignment_from_date').first()
                 
                 if assignment and assignment.shift:
-                    assigned_shift = assignment.shift
-                    logger.info(f"DEBUG: Employee has shift assignment: {assigned_shift.shift_name} ({assigned_shift.start_time} - {assigned_shift.end_time}) [id={assigned_shift.id}]")
-                    
-                    # Step 2: Verify this shift is available in the site's M2M assignments
-                    site_shifts = nearest_site.shifts.filter(id=assigned_shift.id, is_deleted=False)
-                    
+                    shift = assignment.shift
+                    logger.info(f"DEBUG: ✅ SELECTED assigned shift (Priority 1): {shift.shift_name} ({shift.start_time} - {shift.end_time}) [id={shift.id}]")
+                elif nearest_site:
+                    # PRIORITY 2: Fallback to site's assigned shifts if no direct assignment
+                    site_shifts = nearest_site.shifts.filter(is_deleted=False)
                     if site_shifts.exists():
-                        shift = assigned_shift
-                        logger.info(f"DEBUG: ✅ SELECTED assigned shift: {shift.shift_name} ({shift.start_time} - {shift.end_time}) [id={shift.id}]")
-                    else:
-                        # Employee's assigned shift is NOT available at this site
-                        # NOTE: We do NOT fallback to location shift (Priority 3 commented out)
-                        # Employee must have a valid assignment to use shift timing restrictions
-                        shift = None
-                        logger.info(f"DEBUG: ❌ Employee's assigned shift {assigned_shift.id} is NOT in site's M2M table - allowing check-in/out at any time")
-                else:
-                    # No shift assignment found for the employee
-                    # NOTE: We do NOT fallback to location shift (Priority 3 commented out)
-                    # They can check in/out at any time with no timing restrictions
-                    shift = None
-                    logger.info(f"DEBUG: ⚠️ No shift assignment for employee {matched_employee.id} - allowing check-in/out at any time (Priority 3 location shift fallback disabled)")
+                        # Try to find a shift where the user is currently in window
+                        active_shift = None
+                        for s in site_shifts:
+                            in_base, in_grace, _ = self.in_shift_window(now, s, tz=user_tz)
+                            if in_base or in_grace:
+                                active_shift = s
+                                break
+                        
+                        shift = active_shift or site_shifts.first()
+                        if shift:
+                            logger.info(f"DEBUG: ✅ SELECTED site shift (Priority 2): {shift.shift_name} ({shift.start_time} - {shift.end_time}) [id={shift.id}]")
+                
+                if not shift:
+                    logger.info(f"DEBUG: ⚠️ No shift found for employee {matched_employee.id} (Assignment or Site) - allowing check-in/out at any time")
             except Exception as e:
-                logger.exception(f"ERROR fetching employee shift assignment: {e}")
+                logger.exception(f"ERROR fetching shift: {e}")
                 shift = None
         else:
             # No site configured: allow attendance without geofence
@@ -1577,7 +1575,7 @@ class FaceAttendanceView(APIView):
         diff_min = None
 
         if shift:
-            in_base, in_grace, status_hint = self.in_shift_window(now, shift)
+            in_base, in_grace, status_hint = self.in_shift_window(now, shift, tz=user_tz)
 
             # Use the same timezone (user_tz) that was calculated earlier for consistency
             # This ensures shift timing validation uses the correct timezone (user's or location admin's)
@@ -1587,39 +1585,41 @@ class FaceAttendanceView(APIView):
             start_time = shift.start_time
             end_time = shift.end_time
             
-            # Handle overnight shifts correctly (e.g., 22:00 - 06:00)
-            # If end_time <= start_time, it's an overnight shift
-            if end_time > start_time:
-                # Normal day shift (e.g., 09:00 - 18:00)
-                start_dt_naive = datetime.combine(now_local.date(), start_time)
-                end_dt_naive = datetime.combine(now_local.date(), end_time)
-            else:
-                # Overnight shift (e.g., 22:00 - 06:00)
-                # If current time is >= start_time, shift started today and ends tomorrow
-                # If current time is < start_time, shift started yesterday and ends today
-                if now_local.time() >= start_time:
-                    # We're in the first part of the shift (e.g., 23:00 on Jan 15)
-                    start_dt_naive = datetime.combine(now_local.date(), start_time)
-                    end_dt_naive = datetime.combine(now_local.date() + timedelta(days=1), end_time)
+            # Determine the correct shift window (handling overnight shifts and ±1h windows)
+            # We check if 'now_local' falls into today's shift or yesterday's shift window
+            def get_shift_window(anchor_date):
+                s_naive = datetime.combine(anchor_date, start_time)
+                if end_time > start_time:
+                    e_naive = datetime.combine(anchor_date, end_time)
                 else:
-                    # We're in the second part of the shift (e.g., 02:00 on Jan 16, shift started Jan 15 22:00)
-                    start_dt_naive = datetime.combine(now_local.date() - timedelta(days=1), start_time)
-                    end_dt_naive = datetime.combine(now_local.date(), end_time)
-            
-            start_dt = timezone.make_aware(start_dt_naive, tz)
-            end_dt = timezone.make_aware(end_dt_naive, tz)
+                    e_naive = datetime.combine(anchor_date + timedelta(days=1), end_time)
+                
+                s = tz.localize(s_naive) if hasattr(tz, 'localize') else timezone.make_aware(s_naive, tz)
+                e = tz.localize(e_naive) if hasattr(tz, 'localize') else timezone.make_aware(e_naive, tz)
+                return s, e
 
-            # ✅ STRICT SHIFT TIMING: Enforce within shift window only (no ±1 hour grace)
-            # Employees can ONLY mark attendance during their assigned shift hours
-            if now_local < start_dt or now_local > end_dt:
+            # Check two potential windows: the one starting today and the one starting yesterday
+            st_today, et_today = get_shift_window(now_local.date())
+            st_yest, et_yest = get_shift_window(now_local.date() - timedelta(days=1))
+
+            if (st_today - timedelta(hours=1)) <= now_local <= (et_today + timedelta(hours=1)):
+                start_dt, end_dt = st_today, et_today
+            elif (st_yest - timedelta(hours=1)) <= now_local <= (et_yest + timedelta(hours=1)):
+                start_dt, end_dt = st_yest, et_yest
+            else:
+                # Default to today's window for the error message
+                start_dt, end_dt = st_today, et_today
+
+            # ✅ RELAXED SHIFT TIMING: Allow marking attendance 1 hour before and 1 hour after shift
+            if now_local < (start_dt - timedelta(hours=1)) or now_local > (end_dt + timedelta(hours=1)):
                 return Response(
                     {
                         "error": "Outside shift timing",
-                        "message": f"Your shift timing is {start_time.strftime('%I:%M %p')} - {end_time.strftime('%I:%M %p')} is over, please try in your shift.",
+                        "message": f"Your shift timing is {start_time.strftime('%I:%M %p')} - {end_time.strftime('%I:%M %p')}. You can only mark attendance from 1 hour before the start until 1 hour after the end.",
                         "shift_time": f"{start_time.strftime('%I:%M %p')} - {end_time.strftime('%I:%M %p')}",
                         "current_time": now_local.strftime('%I:%M %p'),
-                        "shift_start": start_time.strftime('%I:%M %p'),
-                        "shift_end": end_time.strftime('%I:%M %p')
+                        "allowed_from": (start_dt - timedelta(hours=1)).strftime('%I:%M %p'),
+                        "allowed_until": (end_dt + timedelta(hours=1)).strftime('%I:%M %p')
                     },
                     status=status.HTTP_403_FORBIDDEN
                 )
@@ -1877,30 +1877,40 @@ class FaceAttendanceView(APIView):
         a = sin(dlat/2)**2 + cos(radians(lat)) * cos(radians(site_lat)) * sin(dlon/2)**2
         return R * 2 * asin(sqrt(a))  # distance in meters
 
-    def in_shift_window(self, now, shift):
+    def in_shift_window(self, now, shift, tz=None):
+        if tz is None:
+            tz = timezone.get_current_timezone()
+
         if timezone.is_naive(now):
-            now = timezone.make_aware(now, timezone.get_current_timezone())
+            now = timezone.make_aware(now, pytz.UTC)
 
-        now_local = timezone.localtime(now)
-
-        tz = timezone.get_current_timezone()
+        # Ensure we're comparing in the correct timezone
+        now_local = now.astimezone(tz)
 
         start_time = shift.start_time
         end_time = shift.end_time
 
-        if end_time > start_time:
-            start_dt_naive = datetime.combine(now_local.date(), start_time)
-            end_dt_naive = datetime.combine(now_local.date(), end_time)
-        else:
-            if now_local.time() >= start_time:
-                start_dt_naive = datetime.combine(now_local.date(), start_time)
-                end_dt_naive = datetime.combine(now_local.date() + timedelta(days=1), end_time)
+        def get_shift_window(anchor_date):
+            s_naive = datetime.combine(anchor_date, start_time)
+            if end_time > start_time:
+                e_naive = datetime.combine(anchor_date, end_time)
             else:
-                start_dt_naive = datetime.combine(now_local.date() - timedelta(days=1), start_time)
-                end_dt_naive = datetime.combine(now_local.date(), end_time)
+                e_naive = datetime.combine(anchor_date + timedelta(days=1), end_time)
+            
+            s = tz.localize(s_naive) if hasattr(tz, 'localize') else timezone.make_aware(s_naive, tz)
+            e = tz.localize(e_naive) if hasattr(tz, 'localize') else timezone.make_aware(e_naive, tz)
+            return s, e
 
-        start_dt = timezone.make_aware(start_dt_naive, tz)
-        end_dt = timezone.make_aware(end_dt_naive, tz)
+        # Check today's shift and yesterday's shift
+        st_today, et_today = get_shift_window(now_local.date())
+        st_yest, et_yest = get_shift_window(now_local.date() - timedelta(days=1))
+
+        if (st_today - timedelta(hours=1)) <= now_local <= (et_today + timedelta(hours=1)):
+            start_dt, end_dt = st_today, et_today
+        elif (st_yest - timedelta(hours=1)) <= now_local <= (et_yest + timedelta(hours=1)):
+            start_dt, end_dt = st_yest, et_yest
+        else:
+            start_dt, end_dt = st_today, et_today
 
         try:
             grace_minutes = int(getattr(shift, "grace_timing", 30) or 30)
