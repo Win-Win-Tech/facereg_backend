@@ -1671,6 +1671,28 @@ class FaceAttendanceView(APIView):
                 (end_dt + timedelta(hours=1)),
             )
 
+            # Extra comparison-centric logs for troubleshooting timezone/shift mismatches
+            now_utc_for_log = now if not timezone.is_naive(now) else timezone.make_aware(now, pytz.UTC)
+            logger.info(
+                "ATTN STEP SHIFT-2B: tz=%s now_utc=%s now_local=%s start_dt_local=%s end_dt_local=%s start_dt_utc=%s end_dt_utc=%s",
+                tz_name3,
+                now_utc_for_log,
+                now_local,
+                start_dt,
+                end_dt,
+                start_dt.astimezone(pytz.UTC),
+                end_dt.astimezone(pytz.UTC),
+            )
+            allowed_from_dt = start_dt - timedelta(hours=1)
+            allowed_until_dt = end_dt + timedelta(hours=1)
+            logger.info(
+                "ATTN STEP SHIFT-2C: comparisons now_local<allowed_from=%s now_local>allowed_until=%s (allowed_from=%s allowed_until=%s)",
+                now_local < allowed_from_dt,
+                now_local > allowed_until_dt,
+                allowed_from_dt,
+                allowed_until_dt,
+            )
+
             # ✅ RELAXED SHIFT TIMING: Allow marking attendance 1 hour before and 1 hour after shift
             if now_local < (start_dt - timedelta(hours=1)) or now_local > (end_dt + timedelta(hours=1)):
                 logger.info(
