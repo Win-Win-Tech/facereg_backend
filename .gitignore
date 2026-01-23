@@ -4,7 +4,10 @@ __pycache__/
 *.egg-info/
 *.log
 *.sqlite3
-logs/
+
+# Keep logs directory in repo, ignore its contents
+facereg/logs/*
+!facereg/logs/.gitkeep
 
 # Local virtual environments
 venv/
