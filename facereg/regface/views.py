@@ -1382,6 +1382,19 @@ class FaceAttendanceView(APIView):
         user_tz = get_user_timezone(user, location=employee_location)  # Uses location admin timezone if AnonymousUser
         today = get_user_local_date(user, now, location=employee_location)  # Uses location admin timezone if AnonymousUser
         now_local = now.astimezone(user_tz) if not timezone.is_naive(now) else timezone.make_aware(now, pytz.UTC).astimezone(user_tz)
+
+        # Extra high-signal operational logging to confirm timezone correctness in production
+        # (Journald / gunicorn logs)
+        try:
+            tz_name = getattr(user_tz, "zone", str(user_tz))
+        except Exception:
+            tz_name = str(user_tz)
+        logger.info(
+            "ATTN STEP TZ-1: resolved user_tz=%s now_utc=%s now_local=%s",
+            tz_name,
+            now,
+            now_local,
+        )
         
         # Safe logging - handle AnonymousUser
         user_email = None
@@ -1407,7 +1420,9 @@ class FaceAttendanceView(APIView):
             else:
                 user_timezone_str = 'No location (default)'
         
-        logger.info(f"DEBUG: user={user_email}, employee_location={employee_location.name if employee_location else None}, timezone={user_timezone_str}, today={today}, now_utc={now}, now_local={now_local}")
+        logger.info(
+            f"DEBUG: user={user_email}, employee_location={employee_location.name if employee_location else None}, timezone={user_timezone_str}, today={today}, now_utc={now}, now_local={now_local}"
+        )
         # --- Attendance rules ---
         from django.db.models import Q
 
@@ -1508,12 +1523,29 @@ class FaceAttendanceView(APIView):
         # --- Auto checkin/checkout ---
         # Filter logs by date in user's timezone
         # Since timestamps are stored in UTC, we need to filter by date range that covers the user's local day
-        user_tz = get_user_timezone(user)
+        # IMPORTANT: keep timezone consistent for AnonymousUser by reusing location admin timezone.
+        # If we call get_user_timezone(user) without location, it falls back to Asia/Kolkata and breaks
+        # comparisons against now_local/start_dt/end_dt computed earlier.
+        user_tz = get_user_timezone(user, location=employee_location)
         # Get start and end of day in user's timezone, then convert to UTC for filtering
         start_of_day_local = user_tz.localize(datetime.combine(today, datetime.min.time()))
         end_of_day_local = user_tz.localize(datetime.combine(today, datetime.max.time().replace(microsecond=999999)))
         start_of_day_utc = start_of_day_local.astimezone(pytz.UTC)
         end_of_day_utc = end_of_day_local.astimezone(pytz.UTC)
+
+        try:
+            tz_name2 = getattr(user_tz, "zone", str(user_tz))
+        except Exception:
+            tz_name2 = str(user_tz)
+        logger.info(
+            "ATTN STEP LOGFILTER-1: tz=%s today_local=%s start_of_day_local=%s end_of_day_local=%s start_utc=%s end_utc=%s",
+            tz_name2,
+            today,
+            start_of_day_local,
+            end_of_day_local,
+            start_of_day_utc,
+            end_of_day_utc,
+        )
         
         logs_today = AttendanceLog.objects.filter(
             employee=matched_employee,
@@ -1584,6 +1616,23 @@ class FaceAttendanceView(APIView):
             # now_local = now.astimezone(user_tz) - already calculated at line 1374
             start_time = shift.start_time
             end_time = shift.end_time
+
+            try:
+                tz_name3 = getattr(tz, "zone", str(tz))
+            except Exception:
+                tz_name3 = str(tz)
+            logger.info(
+                "ATTN STEP SHIFT-1: employee_id=%s shift_id=%s shift_name=%s tz=%s now_local=%s start_time=%s end_time=%s in_base=%s in_grace=%s",
+                getattr(matched_employee, "id", None),
+                getattr(shift, "id", None),
+                getattr(shift, "shift_name", None),
+                tz_name3,
+                now_local,
+                start_time,
+                end_time,
+                in_base,
+                in_grace,
+            )
             
             # Determine the correct shift window (handling overnight shifts and ±1h windows)
             # We check if 'now_local' falls into today's shift or yesterday's shift window
@@ -1610,8 +1659,27 @@ class FaceAttendanceView(APIView):
                 # Default to today's window for the error message
                 start_dt, end_dt = st_today, et_today
 
+            logger.info(
+                "ATTN STEP SHIFT-2: st_today=%s et_today=%s st_yest=%s et_yest=%s selected_start=%s selected_end=%s allowed_from=%s allowed_until=%s",
+                st_today,
+                et_today,
+                st_yest,
+                et_yest,
+                start_dt,
+                end_dt,
+                (start_dt - timedelta(hours=1)),
+                (end_dt + timedelta(hours=1)),
+            )
+
             # ✅ RELAXED SHIFT TIMING: Allow marking attendance 1 hour before and 1 hour after shift
             if now_local < (start_dt - timedelta(hours=1)) or now_local > (end_dt + timedelta(hours=1)):
+                logger.info(
+                    "ATTN STEP SHIFT-3: OUTSIDE WINDOW now_local=%s allowed_from=%s allowed_until=%s tz=%s",
+                    now_local,
+                    (start_dt - timedelta(hours=1)),
+                    (end_dt + timedelta(hours=1)),
+                    tz_name3,
+                )
                 return Response(
                     {
                         "error": "Outside shift timing",

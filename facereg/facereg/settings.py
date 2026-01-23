@@ -165,6 +165,10 @@ LOGGING = {
             'format': '{levelname} {message}',
             'style': '{',
         },
+        'verbose': {
+            'format': '{asctime} {levelname} [{name}] {message}',
+            'style': '{',
+        },
     },
     'handlers': {
         'console': {
@@ -172,17 +176,39 @@ LOGGING = {
             'class': 'logging.StreamHandler',
             'formatter': 'simple',
         },
+        # File logging for production troubleshooting (written by the gunicorn worker process)
+        # Defaults to <BASE_DIR>/logs/facereg.log; override via env FACEREG_LOG_FILE if needed.
+        'file': {
+            'level': 'INFO',
+            'class': 'logging.handlers.TimedRotatingFileHandler',
+            'filename': os.environ.get(
+                'FACEREG_LOG_FILE',
+                str((BASE_DIR / 'logs' / 'facereg.log').resolve()),
+            ),
+            'when': 'midnight',
+            'backupCount': 14,
+            'encoding': 'utf-8',
+            'delay': True,
+            'formatter': 'verbose',
+        },
     },
     'loggers': {
         'django': {
-            'handlers': ['console'],
+            'handlers': ['console', 'file'],
             'level': 'INFO',
             'propagate': True,
         },
         'regface': {
-            'handlers': ['console'],
+            'handlers': ['console', 'file'],
             'level': 'INFO',
             'propagate': False,
         },
     },
 }
+
+# Ensure default log directory exists (safe in most deployments; if permission is denied,
+# the file handler will fail when first used and you'll see it in journald).
+try:
+    os.makedirs(BASE_DIR / 'logs', exist_ok=True)
+except Exception:
+    pass
