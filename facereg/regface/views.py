@@ -2421,7 +2421,9 @@ def calculate_attendance_summary(employees, start_date, end_date, user=None, loc
             # Build explanation note for multiple entries
             multiple_entries_note = None
 
-            # Determine effective shift for this day: prefer site-specific shift from logs, else assignment shift
+            # Determine effective shift for this day:
+            # Prefer the shift stored on the AttendanceLog (most accurate for reporting),
+            # then fallback to site-shift inference, then assignment shift.
             effective_shift = None
             site_from_log = None
 
@@ -2437,14 +2439,21 @@ def calculate_attendance_summary(employees, start_date, end_date, user=None, loc
                 elif checkout_count > 1:
                     multiple_entries_note = f"Multiple check-outs ({checkout_count} total). Duration calculated from {paired_count} valid pair(s) with available check-ins."
 
-            # Prefer earliest checkin site's shift, fallback to latest checkout site's shift
-            if earliest_checkin_log and getattr(earliest_checkin_log, 'site', None):
-                site_from_log = getattr(earliest_checkin_log, 'site')
-            elif latest_checkout_log and getattr(latest_checkout_log, 'site', None):
-                site_from_log = getattr(latest_checkout_log, 'site')
+            # 1) Prefer shift stored directly on the attendance logs
+            if earliest_checkin_log and getattr(earliest_checkin_log, 'shift', None):
+                effective_shift = getattr(earliest_checkin_log, 'shift')
+            elif latest_checkout_log and getattr(latest_checkout_log, 'shift', None):
+                effective_shift = getattr(latest_checkout_log, 'shift')
+
+            # 2) If not available, infer from site (only if exactly one shift is assigned to the site)
+            if effective_shift is None:
+                if earliest_checkin_log and getattr(earliest_checkin_log, 'site', None):
+                    site_from_log = getattr(earliest_checkin_log, 'site')
+                elif latest_checkout_log and getattr(latest_checkout_log, 'site', None):
+                    site_from_log = getattr(latest_checkout_log, 'site')
             
             # Get shift from site if available (Site has ManyToMany with Shift)
-            if site_from_log:
+            if effective_shift is None and site_from_log:
                 try:
                     assigned_shifts = list(site_from_log.shifts.filter(is_deleted=False))
                     if len(assigned_shifts) == 1:
