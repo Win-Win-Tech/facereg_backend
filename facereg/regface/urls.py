@@ -1,8 +1,11 @@
 from django.urls import path
 
 from .views import (
+    AssignmentDetailView,
+    AssignmentListCreateView,
     AttendanceSummaryExportView,
     AttendanceSummaryView,
+    BulkAssignmentView,
     EmployeeDetailView,
     EmployeeListView,
     FaceAttendanceView,
@@ -15,8 +18,15 @@ from .views import (
     MonthlyAttendanceStatusView,
     PayrollExportView,
     RegisterEmployeeView,
+    ShiftListCreateView,
+    ShiftDetailView,
+    SiteListCreateView,
+    SiteDetailView,
+    SiteBulkShiftAssignView,
     UserDetailView,
     UserListCreateView,
+    UserSiteDetailView,
+    UserSiteListCreateView,
 )
 
 urlpatterns = [
@@ -52,4 +62,14 @@ urlpatterns = [
     ),
     path("generate-payroll/", GeneratePayrollView.as_view(), name="generate-payroll"),
     path("payroll/export/", PayrollExportView.as_view(), name="payroll-export"),
+    path("shifts/", ShiftListCreateView.as_view(), name="shifts"),
+    path("shifts/<uuid:pk>/", ShiftDetailView.as_view(), name="shift-detail"),
+    path("sites/", SiteListCreateView.as_view(), name="sites"),
+    path("sites/<uuid:pk>/", SiteDetailView.as_view(), name="site-detail"),
+    path("sites/<uuid:pk>/bulk-shifts/", SiteBulkShiftAssignView.as_view(), name="site-bulk-shifts"),
+    path("assignments/", AssignmentListCreateView.as_view(), name="assignments"),
+    path("assignments/<uuid:pk>/", AssignmentDetailView.as_view(), name="assignment-detail"),
+    path("assignments/bulk/", BulkAssignmentView.as_view(), name="bulk-assignments"),
+    path("users/<int:pk>/sites/", UserSiteListCreateView.as_view(), name="user-sites"),
+    path("user-sites/<uuid:pk>/", UserSiteDetailView.as_view(), name="user-site-detail"),
 ]

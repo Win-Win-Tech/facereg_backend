@@ -3,7 +3,7 @@ import base64
 from django.contrib.auth.hashers import make_password
 from rest_framework import serializers
 
-from .models import Employee, Location, User
+from .models import Employee, Location, User, Shift, Site, Assignment, UserSite
 
 
 class FaceUploadSerializer(serializers.Serializer):
@@ -17,6 +17,33 @@ class EmployeeRegisterSerializer(serializers.Serializer):
     )
     face_image = serializers.ImageField()
     profile_photo = serializers.ImageField(required=False, allow_null=True)
+    
+    # Payslip fields
+    gross_salary = serializers.DecimalField(max_digits=10, decimal_places=2, required=False, allow_null=True)
+    payslip_field_config_id = serializers.UUIDField(required=False, allow_null=True)
+    
+    # Employee details (optional)
+    employee_code = serializers.CharField(max_length=50, required=False, allow_null=True, allow_blank=True)
+    department = serializers.CharField(max_length=100, required=False, allow_null=True, allow_blank=True)
+    designation = serializers.CharField(max_length=100, required=False, allow_null=True, allow_blank=True)
+    experience_years = serializers.DecimalField(max_digits=5, decimal_places=2, required=False, allow_null=True)
+    joining_date = serializers.DateField(required=False, allow_null=True)
+    
+    # Banking (optional)
+    bank_account_number = serializers.CharField(max_length=20, required=False, allow_null=True, allow_blank=True)
+    ifsc_code = serializers.CharField(max_length=11, required=False, allow_null=True, allow_blank=True)
+    bank_name = serializers.CharField(max_length=100, required=False, allow_null=True, allow_blank=True)
+    
+    # Identification (optional)
+    pan_number = serializers.CharField(max_length=10, required=False, allow_null=True, allow_blank=True)
+    aadhaar_number = serializers.CharField(max_length=12, required=False, allow_null=True, allow_blank=True)
+    uan_number = serializers.CharField(max_length=12, required=False, allow_null=True, allow_blank=True)
+    esi_number = serializers.CharField(max_length=17, required=False, allow_null=True, allow_blank=True)
+    
+    # Contact (optional)
+    email = serializers.EmailField(required=False, allow_null=True, allow_blank=True)
+    phone = serializers.CharField(max_length=15, required=False, allow_null=True, allow_blank=True)
+    address = serializers.CharField(required=False, allow_null=True, allow_blank=True)
 
     def validate(self, attrs):
         name = attrs.get("name", "").strip()
@@ -110,6 +137,8 @@ class EmployeeSerializer(serializers.ModelSerializer):
     location_name = serializers.CharField(source="location.name", read_only=True)
     photo_data = serializers.SerializerMethodField()
     has_face_encoding = serializers.SerializerMethodField()
+    payslip_field_config_id = serializers.UUIDField(source="payslip_field_config.id", read_only=True, allow_null=True)
+    payslip_field_config_name = serializers.CharField(source="payslip_field_config.config_name", read_only=True, allow_null=True)
 
     class Meta:
         model = Employee
@@ -120,6 +149,24 @@ class EmployeeSerializer(serializers.ModelSerializer):
             "location_name",
             "base_salary",
             "deduction_per_day",
+            "gross_salary",
+            "payslip_field_config_id",
+            "payslip_field_config_name",
+            "employee_code",
+            "department",
+            "designation",
+            "experience_years",
+            "joining_date",
+            "bank_account_number",
+            "ifsc_code",
+            "bank_name",
+            "pan_number",
+            "aadhaar_number",
+            "uan_number",
+            "esi_number",
+            "email",
+            "phone",
+            "address",
             "photo_data",
             "has_face_encoding",
         ]
@@ -140,17 +187,127 @@ class EmployeeUpdateSerializer(serializers.ModelSerializer):
         allow_null=True,
         required=False,
     )
+    payslip_field_config_id = serializers.UUIDField(required=False, allow_null=True, write_only=True)
 
     class Meta:
         model = Employee
-        fields = ["name", "location_id"]
+        fields = [
+            "name",
+            "location_id",
+            "gross_salary",
+            "payslip_field_config_id",
+            "employee_code",
+            "department",
+            "designation",
+            "experience_years",
+            "joining_date",
+            "bank_account_number",
+            "ifsc_code",
+            "bank_name",
+            "pan_number",
+            "aadhaar_number",
+            "uan_number",
+            "esi_number",
+            "email",
+            "phone",
+            "address",
+        ]
         extra_kwargs = {"name": {"required": False}}
 
     def update(self, instance, validated_data):
         location = validated_data.pop("location", None)
         if location is not None:
             instance.location = location
+        
+        payslip_field_config_id = validated_data.pop("payslip_field_config_id", None)
+        if payslip_field_config_id is not None:
+            try:
+                from payslip.models import PayslipFieldConfig
+                instance.payslip_field_config = PayslipFieldConfig.objects.get(pk=payslip_field_config_id, is_deleted=False)
+            except (ImportError, PayslipFieldConfig.DoesNotExist):
+                instance.payslip_field_config = None
+        
         for attr, value in validated_data.items():
             setattr(instance, attr, value)
         instance.save()
         return instance
+
+
+class ShiftSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Shift
+        fields = [
+            "id",
+            "shift_name",
+            "start_time",
+            "end_time",
+            "grace_timing",
+            
+            "created_on",
+            "created_by",
+            "modified_on",
+            "modified_by",
+            "is_deleted",
+            "deleted_by",
+        ]
+        read_only_fields = [
+            "id",
+            "created_on",
+            "modified_on",
+            "created_by",
+            "modified_by",
+            "deleted_by",
+        ]
+
+
+class SiteSerializer(serializers.ModelSerializer):
+    location_name = serializers.CharField(source='location.name', read_only=True)
+    shift_ids = serializers.PrimaryKeyRelatedField(source='shifts', many=True, queryset=Shift.objects.all(), required=False)
+    shifts = ShiftSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = Site
+        fields = [
+            'id', 'site_name', 'latitude', 'longitude', 'location', 'location_name',
+            'shift_ids', 'shifts', 'distance_meters', 'created_on', 'created_by',
+            'modified_on', 'modified_by', 'is_deleted', 'deleted_by'
+        ]
+        read_only_fields = ['id', 'created_on', 'modified_on', 'created_by', 'modified_by', 'deleted_by']
+
+    def create(self, validated_data):
+        shifts = validated_data.pop('shifts', [])
+        site = Site.objects.create(**validated_data)
+        if shifts:
+            site.shifts.set(shifts)
+        return site
+
+    def update(self, instance, validated_data):
+        shifts = validated_data.pop('shifts', None)
+        for attr, value in validated_data.items():
+            setattr(instance, attr, value)
+        instance.save()
+        if shifts is not None:
+            instance.shifts.set(shifts)
+        return instance
+
+
+class AssignmentSerializer(serializers.ModelSerializer):
+    user_name = serializers.CharField(source='user.name', read_only=True)
+    shift_name = serializers.CharField(source='shift.shift_name', read_only=True)
+    location_name = serializers.CharField(source='location.name', read_only=True)
+    shift = serializers.PrimaryKeyRelatedField(queryset=Shift.objects.all(), allow_null=True, required=False)
+
+    class Meta:
+        model = Assignment
+        fields = '__all__'
+        read_only_fields = ['id', 'created_on', 'modified_on', 'created_by', 'modified_by', 'deleted_by']
+
+
+class UserSiteSerializer(serializers.ModelSerializer):
+    user_name = serializers.CharField(source='user.name', read_only=True)
+    site_name = serializers.CharField(source='site.site_name', read_only=True)
+
+    class Meta:
+        model = UserSite
+        fields = '__all__'
+        read_only_fields = ['id', 'created_on', 'modified_on', 'assigned_on', 'created_by', 'modified_by', 'deleted_by', 'assigned_by']

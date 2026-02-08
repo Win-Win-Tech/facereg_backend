@@ -4,6 +4,8 @@ from django.urls import path, include
 urlpatterns = [
     path('admin/', admin.site.urls),
     path('api/', include('regface.urls')),  # ✅ All regface views are routed here
+    path('api/', include('payslip.urls')),  # ✅ All payslip views are routed here
+    path('api/', include('leave.urls')),  # ✅ All leave views are routed here
     path('shift/', include('createshift.urls')),  # ✅ All regface views are routed here
 
 ]
